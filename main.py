@@ -56,8 +56,8 @@ async def vytvor_objednavku(order: PizzaOrder):
             "adresa": order.address
         }
 
-        # Zápis do tabuľky 'objednavky'
-        response = supabase.table("objednavky").insert(order_data).execute()
+        # Zápis do tabuľky 'pizza_orders' (zmena názvu pre integráciu)
+        response = supabase.table("pizza_orders").insert(order_data).execute()
 
         # ElevenLabs očakáva jednoduchú a jasnú odpoveď
         return {
