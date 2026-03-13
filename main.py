@@ -11,8 +11,8 @@ load_dotenv()
 app = FastAPI(title="ElevenLabs Pizza Webhook")
 
 # --- KONFIGURÁCIA SUPABASE ---
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.getenv("CORE_SUPABASE_URL")
+SUPABASE_KEY = os.getenv("CORE_SUPABASE_SERVICE_ROLE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     # V produkcii na Renderi je dôležité mať tieto premenné nastavené
