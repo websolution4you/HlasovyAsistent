@@ -11,12 +11,14 @@ load_dotenv()
 app = FastAPI(title="ElevenLabs Pizza Webhook")
 
 # --- KONFIGURÁCIA SUPABASE ---
-SUPABASE_URL = os.getenv("CORE_SUPABASE_URL")
-SUPABASE_KEY = os.getenv("CORE_SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_URL = os.getenv("CORE_SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.getenv("CORE_SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    # V produkcii na Renderi je dôležité mať tieto premenné nastavené
-    print("VAROVANIE: Chýbajú environment premenné SUPABASE_URL alebo SUPABASE_KEY!")
+    print("--- CHYBA KONFIGURÁCIE ---")
+    if not SUPABASE_URL: print("Chýba premenná: CORE_SUPABASE_URL")
+    if not SUPABASE_KEY: print("Chýba premenná: CORE_SUPABASE_SERVICE_ROLE_KEY")
+    print("--------------------------")
 
 try:
     # Inicializácia Supabase klienta
