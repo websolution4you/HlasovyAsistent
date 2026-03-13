@@ -60,7 +60,7 @@ async def twilio_voice_webhook():
     message = os.getenv("TWILIO_VOICE_MESSAGE", DEFAULT_TWILIO_VOICE_MESSAGE).strip()
     twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="alice" language="sk-SK">{message}</Say>
+    <Say voice="Polly.Vlasta" language="sk-SK">{message}</Say>
     <Pause length="1"/>
     <Hangup/>
 </Response>'''
@@ -74,7 +74,7 @@ async def twilio_fallback_webhook():
     """
     twiml = '''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="alice" language="sk-SK">Ospravedlnujeme sa, linka je docasne nedostupna. Skuste prosim zavolat neskor.</Say>
+    <Say voice="Polly.Vlasta" language="sk-SK">Ospravedlnujeme sa, linka je docasne nedostupna. Skuste prosim zavolat neskor.</Say>
     <Hangup/>
 </Response>'''
     return Response(content=twiml, media_type="application/xml")
