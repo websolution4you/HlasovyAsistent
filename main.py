@@ -66,10 +66,12 @@ async def vytvor_objednavku(order: PizzaOrder):
         }
 
     except Exception as e:
-        print(f"Chyba pri zápise do databázy: {e}")
+        # Vrátenie detailnej chyby, aby sme vedeli, čo presne v Supabase zlyhalo
+        error_msg = str(e)
+        print(f"DEBUG CHYBA: {error_msg}")
         raise HTTPException(
             status_code=500, 
-            detail=f"Nepodarilo sa zapísať objednávku: {str(e)}"
+            detail=f"Chyba Supabase: {error_msg}"
         )
 
 # Inštrukcia pre Render Start Command:
