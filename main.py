@@ -1,7 +1,9 @@
 import os
+import difflib
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
+from typing import Optional
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -20,6 +22,8 @@ DEFAULT_TWILIO_VOICE_MESSAGE = (
 SUPABASE_URL = os.getenv("CORE_SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("CORE_SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
+TENANT_ID = os.getenv("TENANT_ID", "").strip()
+
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("--- CHYBA KONFIGURACIE ---")
     if not SUPABASE_URL:
@@ -27,6 +31,8 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     if not SUPABASE_KEY:
         print("Chyba premenna: CORE_SUPABASE_SERVICE_ROLE_KEY")
     print("--------------------------")
+if not TENANT_ID:
+    print("VAROVANIE: TENANT_ID nie je nastavene")
 
 try:
     # Inicializacia Supabase klienta
@@ -36,11 +42,51 @@ except Exception as e:
     supabase = None
 
 
-class PizzaOrder(BaseModel):
+class ManageOrder(BaseModel):
     pizza_type: str
-    upsell: str = "ziadny"
-    address: str
-    phone_number: str  # Pridané pole pre telefón
+    total_price: float
+    delivery_address: str
+    customer_phone: str = ""
+    upsell_item: Optional[str] = None
+    upsell_accepted: bool = False
+
+
+def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
+    """Fuzzy match adresy voči tabuľke ulíc. Vracia (matched_address, confidence 0-1)."""
+    if not supabase or not tenant_id:
+        return raw_address, 0
+
+    try:
+        result = supabase.table("streets").select("name").eq("tenant_id", tenant_id).execute()
+        if not result.data:
+            return raw_address, 0
+
+        street_names = [s["name"] for s in result.data]
+
+        # Skus oddeliť číslo domu z konca adresy
+        parts = raw_address.strip().rsplit(maxsplit=1)
+        if len(parts) == 2 and any(c.isdigit() for c in parts[1]):
+            street_part = parts[0]
+            house_number = parts[1]
+        else:
+            street_part = raw_address.strip()
+            house_number = ""
+
+        # Fuzzy match voči názvom ulíc
+        street_names_lower = {name.lower(): name for name in street_names}
+        matches = difflib.get_close_matches(
+            street_part.lower(), street_names_lower.keys(), n=1, cutoff=0.6
+        )
+
+        if matches:
+            matched_name = street_names_lower[matches[0]]
+            matched_address = f"{matched_name} {house_number}".strip() if house_number else matched_name
+            return matched_address, 1
+
+        return raw_address, 0
+    except Exception as e:
+        print(f"Chyba pri matchovani adresy: {e}")
+        return raw_address, 0
 
 
 @app.get("/")
@@ -92,19 +138,28 @@ async def twilio_status_webhook(request: Request):
 
 
 @app.post("/api/vytvor-objednavku")
-async def vytvor_objednavku(order: PizzaOrder):
+async def vytvor_objednavku(order: ManageOrder):
     """
-    Endpoint pre ElevenLabs agenta na ulozenie objednavky do DB.
+    Endpoint pre ElevenLabs agenta (manage_order tool) na ulozenie objednavky do DB.
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
 
     try:
+        matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
+
         order_data = {
-            "pizza": order.pizza_type,
-            "upsell": order.upsell,
-            "adresa": order.address,
-            "telefon": order.phone_number  # Zápis čísla do DB
+            "tenant_id": TENANT_ID,
+            "customer_phone": order.customer_phone,
+            "pizza_type": order.pizza_type,
+            "total_price": order.total_price,
+            "delivery_address": matched_address,
+            "address_raw": order.delivery_address,
+            "address_confidence": confidence,
+            "upsell_offered": order.upsell_item is not None,
+            "upsell_item": order.upsell_item,
+            "upsell_accepted": order.upsell_accepted,
+            "status": "NEW",
         }
 
         supabase.table("pizza_orders").insert(order_data).execute()
