@@ -49,6 +49,7 @@ class ManageOrder(BaseModel):
     customer_phone: str = ""
     upsell_item: Optional[str] = None
     upsell_accepted: bool = False
+    transcript: Optional[str] = None
 
 
 ALLERGEN_MAP = {
@@ -224,6 +225,8 @@ async def vytvor_objednavku(order: ManageOrder):
         order_data = {
             "tenant_id": TENANT_ID,
             "customer_phone": order.customer_phone,
+            "phone_raw": order.customer_phone,
+            "customer_name": "ElevenLabs",
             "pizza_type": order.pizza_type,
             "total_price": order.total_price,
             "delivery_address": matched_address,
@@ -232,6 +235,7 @@ async def vytvor_objednavku(order: ManageOrder):
             "upsell_offered": order.upsell_item is not None,
             "upsell_item": order.upsell_item,
             "upsell_accepted": order.upsell_accepted,
+            "notes": order.transcript,
             "status": "NEW",
         }
 
