@@ -233,7 +233,7 @@ async def vytvor_objednavku(order: ManageOrder):
             "tenant_id": TENANT_ID,
             "customer_phone": order.customer_phone,
             "phone_raw": order.customer_phone,
-            "customer_name": order.customer_name or "ElevenLabs",
+            "customer_name": order.customer_name or "Zákazník",
             "pizza_type": order.pizza_type,
             "total_price": order.total_price,
             "delivery_address": matched_address,
