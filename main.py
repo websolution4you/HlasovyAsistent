@@ -113,7 +113,9 @@ def format_menu_from_db(tenant_id: str) -> str:
 
 
 def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
-    """Fuzzy match adresy voči tabuľke ulíc. Vracia (matched_address, confidence 0-1)."""
+    """Fuzzy match adresy voči tabuľke ulíc. Vracia (matched_address, confidence 0-1).
+    Podporuje čísla ako cifry aj slová (napr. 'Dlhá tri', 'Levočská dvanásť').
+    """
     if not supabase or not tenant_id:
         return raw_address, 0
 
@@ -123,27 +125,31 @@ def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
             return raw_address, 0
 
         street_names = [s["name"] for s in result.data]
-
-        # Skus oddeliť číslo domu z konca adresy
-        parts = raw_address.strip().rsplit(maxsplit=1)
-        if len(parts) == 2 and any(c.isdigit() for c in parts[1]):
-            street_part = parts[0]
-            house_number = parts[1]
-        else:
-            street_part = raw_address.strip()
-            house_number = ""
-
-        # Fuzzy match voči názvom ulíc
         street_names_lower = {name.lower(): name for name in street_names}
-        matches = difflib.get_close_matches(
-            street_part.lower(), street_names_lower.keys(), n=1, cutoff=0.6
-        )
 
-        if matches:
-            matched_name = street_names_lower[matches[0]]
-            matched_address = f"{matched_name} {house_number}".strip() if house_number else matched_name
-            return matched_address, 1
+        address = raw_address.strip()
+        parts = address.rsplit(maxsplit=1)
 
+        # Kandidáti na street_part + house_number:
+        # 1. Posledné slovo je číslica (napr. "Dlhá 5")
+        # 2. Posledné slovo nie je číslica ale adresa má viac slov (napr. "Dlhá tri")
+        # 3. Celá adresa je len jeden výraz (napr. "Rozvoj")
+        candidates = []
+        if len(parts) == 2:
+            candidates.append((parts[0], parts[1]))  # bez posledného slova
+        candidates.append((address, ""))  # celá adresa bez čísla
+
+        for street_part, house_number in candidates:
+            matches = difflib.get_close_matches(
+                street_part.lower(), street_names_lower.keys(), n=1, cutoff=0.6
+            )
+            if matches:
+                matched_name = street_names_lower[matches[0]]
+                matched_address = f"{matched_name} {house_number}".strip() if house_number else matched_name
+                print(f"Address match: '{address}' -> '{matched_address}'")
+                return matched_address, 1
+
+        print(f"Address no match: '{address}'")
         return raw_address, 0
     except Exception as e:
         print(f"Chyba pri matchovani adresy: {e}")
