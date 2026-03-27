@@ -51,6 +51,65 @@ class ManageOrder(BaseModel):
     upsell_accepted: bool = False
 
 
+ALLERGEN_MAP = {
+    "1": "lepok", "2": "kôrovce", "3": "vajcia", "4": "ryby",
+    "5": "arašidy", "6": "sója", "7": "mlieko", "8": "orechy",
+    "9": "zeler", "10": "horčica", "11": "sezam", "12": "oxid siričitý",
+    "13": "vlčí bôb", "14": "mäkkýše",
+}
+
+
+def format_menu_from_db(tenant_id: str) -> str:
+    """Načíta menu_items z DB a naformátuje ako text pre system prompt."""
+    if not supabase or not tenant_id:
+        return ""
+
+    try:
+        result = (
+            supabase.table("menu_items")
+            .select("name, price, ingredients, allergens")
+            .eq("tenant_id", tenant_id)
+            .order("price")
+            .execute()
+        )
+        if not result.data:
+            return ""
+
+        pizzas = []
+        drinks = []
+        for item in result.data:
+            name = item["name"]
+            price = item["price"]
+            ingredients = item.get("ingredients", "")
+            allergens_raw = item.get("allergens") or []
+
+            allergen_names = ", ".join(
+                ALLERGEN_MAP.get(str(a), str(a)) for a in allergens_raw
+            ) if allergens_raw else ""
+
+            # Jednoduché rozlíšenie: ak nemá ingrediencie typické pre pizzu, je to nápoj
+            if item.get("ingredients") and "salsa" not in (ingredients or "").lower() and "základ" not in (ingredients or "").lower() and price <= 5:
+                drinks.append(f"| {name} | {price:.2f}€ | {ingredients} |")
+            else:
+                allergen_str = f" | {allergen_names}" if allergen_names else " |"
+                pizzas.append(f"| {name} | {price:.2f}€ | {ingredients}{allergen_str}")
+
+        lines = ["MENU:", "| Pizza | Cena | Ingrediencie | Alergény |", "|-------|------|-------------|----------|"]
+        lines.extend(pizzas)
+
+        if drinks:
+            lines.append("")
+            lines.append("NÁPOJE:")
+            lines.append("| Nápoj | Cena | Popis |")
+            lines.append("|-------|------|-------|")
+            lines.extend(drinks)
+
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"Chyba pri nacitani menu: {e}")
+        return ""
+
+
 def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
     """Fuzzy match adresy voči tabuľke ulíc. Vracia (matched_address, confidence 0-1)."""
     if not supabase or not tenant_id:
@@ -135,6 +194,20 @@ async def twilio_status_webhook(request: Request):
     payload = dict(form_data)
     print(f"Twilio status callback: {payload}")
     return {"status": "ok"}
+
+
+@app.post("/api/prompt-config")
+async def prompt_config():
+    """
+    ElevenLabs Server URL endpoint — volá sa pred každým hovorom.
+    Vracia dynamic_variables s aktuálnym menu z DB.
+    """
+    menu_text = format_menu_from_db(TENANT_ID)
+    return {
+        "dynamic_variables": {
+            "menu": menu_text if menu_text else "Menu nie je momentálne dostupné.",
+        }
+    }
 
 
 @app.post("/api/vytvor-objednavku")
