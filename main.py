@@ -47,6 +47,7 @@ class ManageOrder(BaseModel):
     total_price: float
     delivery_address: str
     customer_phone: str = ""
+    customer_name: Optional[str] = None
     upsell_item: Optional[str] = None
     upsell_accepted: bool = False
     transcript: Optional[str] = None
@@ -226,7 +227,7 @@ async def vytvor_objednavku(order: ManageOrder):
             "tenant_id": TENANT_ID,
             "customer_phone": order.customer_phone,
             "phone_raw": order.customer_phone,
-            "customer_name": "ElevenLabs",
+            "customer_name": order.customer_name or "ElevenLabs",
             "pizza_type": order.pizza_type,
             "total_price": order.total_price,
             "delivery_address": matched_address,
