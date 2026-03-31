@@ -296,12 +296,16 @@ async def search_street(body: SearchStreetRequest):
     if not streets:
         return {"found": False, "message": "Na túto adresu momentálne nevieme doručiť.", "suggestions": []}
 
+    print(f"[search-street] query='{query}' streets_count={len(streets)}")
+
     scored = sorted(
         ({"street": s, "score": _street_score(query, s)} for s in streets),
         key=lambda x: x["score"],
         reverse=True,
     )
     top = [item for item in scored[:2] if item["score"] >= 55]
+
+    print(f"[search-street] top_results={top}")
 
     if not top:
         return {"found": False, "message": "Na túto adresu momentálne nevieme doručiť.", "suggestions": []}
