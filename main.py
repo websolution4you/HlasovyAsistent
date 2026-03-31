@@ -112,7 +112,7 @@ def _get_streets_cached(tenant_id: str) -> list[str]:
     ):
         return _STREETS_CACHE["data"]
 
-    result = supabase.table("streets").select("name").eq("tenant_id", tenant_id).execute()
+    result = supabase.table("streets").select("name").execute()
     streets = [row["name"] for row in result.data] if result.data else []
     _STREETS_CACHE.update({"data": streets, "tenant_id": tenant_id, "timestamp": now})
     return streets
