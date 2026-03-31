@@ -1,5 +1,7 @@
 import os
+import time
 import difflib
+import unicodedata
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -42,6 +44,10 @@ except Exception as e:
     supabase = None
 
 
+class SearchStreetRequest(BaseModel):
+    query: str
+
+
 class ManageOrder(BaseModel):
     pizza_type: str
     total_price: float
@@ -59,6 +65,57 @@ ALLERGEN_MAP = {
     "9": "zeler", "10": "horčica", "11": "sezam", "12": "oxid siričitý",
     "13": "vlčí bôb", "14": "mäkkýše",
 }
+
+
+_STREETS_CACHE: dict = {"data": [], "tenant_id": "", "timestamp": 0.0}
+_CACHE_TTL = 300  # 5 minút
+
+
+def _normalize(s: str) -> str:
+    """Lowercase + odstránenie diakritiky."""
+    nfkd = unicodedata.normalize("NFD", s.lower().strip())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _partial_ratio(query: str, target: str) -> float:
+    """Najlepší SequenceMatcher.ratio() pre query ako okno v target (partial match)."""
+    if not query or not target:
+        return 0.0
+    if len(query) > len(target):
+        return difflib.SequenceMatcher(None, query, target).ratio()
+    best = 0.0
+    for i in range(len(target) - len(query) + 1):
+        r = difflib.SequenceMatcher(None, query, target[i:i + len(query)]).ratio()
+        if r > best:
+            best = r
+            if best == 1.0:
+                break
+    return best
+
+
+def _street_score(query: str, street: str) -> int:
+    """Vráti skóre 0–100 (max z full ratio a partial ratio)."""
+    q = _normalize(query)
+    s = _normalize(street)
+    full = difflib.SequenceMatcher(None, q, s).ratio()
+    partial = _partial_ratio(q, s)
+    return round(max(full, partial) * 100)
+
+
+def _get_streets_cached(tenant_id: str) -> list[str]:
+    """Načíta ulice z DB, výsledok cachuje na 5 minút."""
+    now = time.monotonic()
+    if (
+        _STREETS_CACHE["tenant_id"] == tenant_id
+        and _STREETS_CACHE["data"]
+        and now - _STREETS_CACHE["timestamp"] < _CACHE_TTL
+    ):
+        return _STREETS_CACHE["data"]
+
+    result = supabase.table("streets").select("name").eq("tenant_id", tenant_id).execute()
+    streets = [row["name"] for row in result.data] if result.data else []
+    _STREETS_CACHE.update({"data": streets, "tenant_id": tenant_id, "timestamp": now})
+    return streets
 
 
 def format_menu_from_db(tenant_id: str) -> str:
@@ -215,6 +272,45 @@ async def prompt_config():
         "dynamic_variables": {
             "menu": menu_text if menu_text else "Menu nie je momentálne dostupné.",
         }
+    }
+
+
+@app.post("/api/search-street")
+async def search_street(body: SearchStreetRequest):
+    """
+    Fuzzy vyhľadávanie ulice podľa časti názvu (STT výstup z ElevenLabs).
+    Cachuje ulice z DB na 5 minút. Vracia max 2 zhody so skóre ≥ 55.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
+
+    query = body.query.strip()
+    if not query:
+        raise HTTPException(status_code=422, detail="Parameter query nesmie byť prázdny.")
+
+    try:
+        streets = _get_streets_cached(TENANT_ID)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chyba pri načítaní ulíc: {e}")
+
+    if not streets:
+        return {"found": False, "message": "Na túto adresu momentálne nevieme doručiť.", "suggestions": []}
+
+    scored = sorted(
+        ({"street": s, "score": _street_score(query, s)} for s in streets),
+        key=lambda x: x["score"],
+        reverse=True,
+    )
+    top = [item for item in scored[:2] if item["score"] >= 55]
+
+    if not top:
+        return {"found": False, "message": "Na túto adresu momentálne nevieme doručiť.", "suggestions": []}
+
+    return {
+        "found": True,
+        "best_match": top[0]["street"],
+        "confidence": top[0]["score"],
+        "suggestions": top,
     }
 
 
