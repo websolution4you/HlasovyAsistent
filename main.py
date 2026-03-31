@@ -1,7 +1,7 @@
 import os
 import time
-import difflib
 import unicodedata
+from rapidfuzz import fuzz, process
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -77,29 +77,11 @@ def _normalize(s: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
-def _partial_ratio(query: str, target: str) -> float:
-    """Najlepší SequenceMatcher.ratio() pre query ako okno v target (partial match)."""
-    if not query or not target:
-        return 0.0
-    if len(query) > len(target):
-        return difflib.SequenceMatcher(None, query, target).ratio()
-    best = 0.0
-    for i in range(len(target) - len(query) + 1):
-        r = difflib.SequenceMatcher(None, query, target[i:i + len(query)]).ratio()
-        if r > best:
-            best = r
-            if best == 1.0:
-                break
-    return best
-
-
 def _street_score(query: str, street: str) -> int:
-    """Vráti skóre 0–100 (max z full ratio a partial ratio)."""
+    """Vráti skóre 0–100 (max z ratio a partial_ratio cez rapidfuzz)."""
     q = _normalize(query)
     s = _normalize(street)
-    full = difflib.SequenceMatcher(None, q, s).ratio()
-    partial = _partial_ratio(q, s)
-    return round(max(full, partial) * 100)
+    return round(max(fuzz.ratio(q, s), fuzz.partial_ratio(q, s)))
 
 
 def _get_streets_cached(tenant_id: str) -> list[str]:
@@ -197,9 +179,10 @@ def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
         candidates.append((address, ""))  # celá adresa bez čísla
 
         for street_part, house_number in candidates:
-            matches = difflib.get_close_matches(
-                street_part.lower(), street_names_lower.keys(), n=1, cutoff=0.6
+            results = process.extractOne(
+                street_part.lower(), street_names_lower.keys(), score_cutoff=60
             )
+            matches = [results[0]] if results else []
             if matches:
                 matched_name = street_names_lower[matches[0]]
                 matched_address = f"{matched_name} {house_number}".strip() if house_number else matched_name
