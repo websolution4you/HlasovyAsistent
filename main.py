@@ -291,6 +291,8 @@ async def search_street(body: SearchStreetRequest):
     try:
         streets = _get_streets_cached(TENANT_ID)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Chyba pri načítaní ulíc: {e}")
 
     if not streets:
