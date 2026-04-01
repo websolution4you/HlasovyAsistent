@@ -204,6 +204,11 @@ async def health_check():
     return {"status": "online", "message": "Server bezi."}
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.api_route("/twilio/voice", methods=["GET", "POST"])
 async def twilio_voice_webhook():
     """
