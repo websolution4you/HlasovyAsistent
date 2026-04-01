@@ -159,7 +159,7 @@ def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
         return raw_address, 0
 
     try:
-        result = supabase.table("streets").select("name").eq("tenant_id", tenant_id).execute()
+        result = supabase.table("streets").select("name").execute()
         if not result.data:
             return raw_address, 0
 
