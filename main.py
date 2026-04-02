@@ -87,7 +87,7 @@ class ManageOrder(BaseModel):
     pizza_type: str
     total_price: float
     delivery_address: str
-    customer_phone: str = ""
+    customer_phone: Optional[str] = None
     customer_name: Optional[str] = None
     upsell_item: Optional[str] = None
     upsell_accepted: bool = False
@@ -383,8 +383,8 @@ async def vytvor_objednavku(request: Request):
 
         order_data = {
             "tenant_id": TENANT_ID,
-            "customer_phone": order.customer_phone,
-            "phone_raw": order.customer_phone,
+            "customer_phone": order.customer_phone or "",
+            "phone_raw": order.customer_phone or "",
             "customer_name": order.customer_name or "Zákazník",
             "pizza_type": order.pizza_type,
             "total_price": order.total_price,
