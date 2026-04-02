@@ -3,6 +3,7 @@ import time
 import unicodedata
 from rapidfuzz import fuzz, process
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Optional
@@ -13,6 +14,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI(title="ElevenLabs Pizza Webhook")
+
+
+def _parse_cors_origins() -> list[str]:
+    """
+    Nacita povolene originy pre web frontend.
+    Defaultne povoli localhosty pre lokalny vyvoj.
+    V Renderi nastav CORS_ALLOW_ORIGINS ako ciarkou oddeleny zoznam.
+    """
+    raw = os.getenv(
+        "CORS_ALLOW_ORIGINS",
+        "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173",
+    ).strip()
+    if raw == "*":
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+CORS_ALLOW_ORIGINS = _parse_cors_origins()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DEFAULT_TWILIO_VOICE_MESSAGE = (
     "Dobry den, dovolali ste sa do Pizza Sicilia. "
@@ -35,6 +62,14 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     print("--------------------------")
 if not TENANT_ID:
     print("VAROVANIE: TENANT_ID nie je nastavene")
+
+print("--- STARTUP KONFIG ---")
+print(f"PORT: {os.getenv('PORT', 'nenastaveny')}")
+print(f"CORE_SUPABASE_URL nastavene: {'ano' if bool(SUPABASE_URL) else 'nie'}")
+print(f"CORE_SUPABASE_SERVICE_ROLE_KEY nastavene: {'ano' if bool(SUPABASE_KEY) else 'nie'}")
+print(f"TENANT_ID nastavene: {'ano' if bool(TENANT_ID) else 'nie'}")
+print(f"CORS_ALLOW_ORIGINS: {CORS_ALLOW_ORIGINS}")
+print("----------------------")
 
 try:
     # Inicializacia Supabase klienta
@@ -209,6 +244,25 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/health/config")
+def health_config():
+    """
+    Bezpecny endpoint na rychlu kontrolu Render konfiguracie.
+    Nevracia tajne hodnoty, iba ich dostupnost.
+    """
+    return {
+        "status": "ok",
+        "config": {
+            "port_present": bool(os.getenv("PORT")),
+            "supabase_url_present": bool(SUPABASE_URL),
+            "supabase_key_present": bool(SUPABASE_KEY),
+            "tenant_id_present": bool(TENANT_ID),
+            "supabase_client_ready": supabase is not None,
+            "cors_allow_origins": CORS_ALLOW_ORIGINS,
+        },
+    }
+
+
 @app.api_route("/twilio/voice", methods=["GET", "POST"])
 async def twilio_voice_webhook():
     """
@@ -309,12 +363,20 @@ async def search_street(body: SearchStreetRequest):
 
 
 @app.post("/api/vytvor-objednavku")
-async def vytvor_objednavku(order: ManageOrder):
+async def vytvor_objednavku(request: Request):
     """
     Endpoint pre ElevenLabs agenta (manage_order tool) na ulozenie objednavky do DB.
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
+
+    try:
+        body = await request.json()
+        print(f"[vytvor-objednavku] raw body: {body}")
+        order = ManageOrder(**body)
+    except Exception as e:
+        print(f"[vytvor-objednavku] validacna chyba: {e}")
+        raise HTTPException(status_code=422, detail=str(e))
 
     try:
         matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
