@@ -1,12 +1,15 @@
 import os
 import time
+import asyncio
 import unicodedata
+from dataclasses import dataclass, field
+from typing import Dict, Optional
 from rapidfuzz import fuzz, process
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
-from typing import Optional
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -52,6 +55,8 @@ SUPABASE_URL = os.getenv("CORE_SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("CORE_SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 TENANT_ID = os.getenv("TENANT_ID", "").strip()
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+FINALIZE_DELAY_SECONDS = float(os.getenv("FINALIZE_DELAY_SECONDS", "2.0"))
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("--- CHYBA KONFIGURACIE ---")
@@ -64,6 +69,8 @@ if not TENANT_ID:
     print("VAROVANIE: TENANT_ID nie je nastavene")
 
 print("--- STARTUP KONFIG ---")
+print(f"ELEVENLABS_API_KEY nastavene: {'ano' if bool(ELEVENLABS_API_KEY) else 'nie'}")
+print(f"FINALIZE_DELAY_SECONDS: {FINALIZE_DELAY_SECONDS}")
 print(f"PORT: {os.getenv('PORT', 'nenastaveny')}")
 print(f"CORE_SUPABASE_URL nastavene: {'ano' if bool(SUPABASE_URL) else 'nie'}")
 print(f"CORE_SUPABASE_SERVICE_ROLE_KEY nastavene: {'ano' if bool(SUPABASE_KEY) else 'nie'}")
@@ -77,6 +84,88 @@ try:
 except Exception as e:
     print(f"Chyba pri inicializacii Supabase: {e}")
     supabase = None
+
+
+# ---------------------------------------------------------------------------
+# SESSION STATE — in-memory, keyed by ElevenLabs conversation_id
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CallSession:
+    conversation_id: str
+    order_finalized: bool = False       # manage_order úspešne vykonaný (DB insert)
+    call_ending: bool = False           # end_call bol spustený (hovor sa ukončuje)
+    finalize_task: Optional[asyncio.Task] = None  # pending auto-hangup timer
+    created_at: float = field(default_factory=time.monotonic)
+
+
+_SESSIONS: Dict[str, CallSession] = {}
+_SESSION_TTL = 3600  # 1 hodina — po nej sa session vyčistí (lazy)
+
+
+def _cleanup_old_sessions() -> None:
+    """Vyčistí sessions staršie ako SESSION_TTL. Volá sa lazy pri každom prístupe."""
+    now = time.monotonic()
+    stale = [cid for cid, s in _SESSIONS.items() if now - s.created_at > _SESSION_TTL]
+    for cid in stale:
+        _SESSIONS.pop(cid, None)
+
+
+def get_or_create_session(conversation_id: str) -> CallSession:
+    _cleanup_old_sessions()
+    if conversation_id not in _SESSIONS:
+        _SESSIONS[conversation_id] = CallSession(conversation_id=conversation_id)
+    return _SESSIONS[conversation_id]
+
+
+def extract_conversation_id(request: Request) -> Optional[str]:
+    """Extrahuje conversation_id z ElevenLabs HTTP hlavičky alebo query parametra."""
+    # ElevenLabs posiela conversation_id v hlavičke
+    cid = request.headers.get("ElevenLabs-Conversation-Id") or request.headers.get("elevenlabs-conversation-id")
+    if cid:
+        return cid.strip()
+    return None
+
+
+def cancel_post_summary_finalize(session: CallSession) -> None:
+    """Zruší pending auto-hangup timer ak existuje."""
+    if session.finalize_task and not session.finalize_task.done():
+        session.finalize_task.cancel()
+        print(f"[session:{session.conversation_id}] finalize timer zruseny")
+    session.finalize_task = None
+
+
+async def elevenlabs_end_call_api(conversation_id: str) -> None:
+    """Zavolá ElevenLabs REST API na ukončenie konverzácie."""
+    if not ELEVENLABS_API_KEY:
+        print(f"[session:{conversation_id}] ELEVENLABS_API_KEY nie je nastaveny — auto-hangup preskoceny")
+        return
+    url = f"https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.delete(url, headers={"xi-api-key": ELEVENLABS_API_KEY})
+        print(f"[session:{conversation_id}] ElevenLabs end_call API -> {resp.status_code}")
+    except Exception as e:
+        print(f"[session:{conversation_id}] ElevenLabs end_call API chyba: {e}")
+
+
+def schedule_auto_end_call(session: CallSession, delay: float = FINALIZE_DELAY_SECONDS) -> None:
+    """Naplánuje asyncio task ktorý po 'delay' sekundách zavolá ElevenLabs API na hangup."""
+    cancel_post_summary_finalize(session)  # zruší prípadný predchádzajúci timer
+
+    async def _auto_hangup():
+        await asyncio.sleep(delay)
+        session_now = _SESSIONS.get(session.conversation_id)
+        if session_now and not session_now.call_ending:
+            session_now.call_ending = True
+            print(f"[session:{session.conversation_id}] auto-hangup timer dobehol — volam ElevenLabs API")
+            await elevenlabs_end_call_api(session.conversation_id)
+
+    session.finalize_task = asyncio.create_task(_auto_hangup())
+    print(f"[session:{session.conversation_id}] auto-hangup timer nastaveny na {delay}s")
+
+
+# ---------------------------------------------------------------------------
 
 
 class SearchStreetRequest(BaseModel):
@@ -318,11 +407,17 @@ async def prompt_config():
 
 
 @app.post("/api/search-street")
-async def search_street(body: SearchStreetRequest):
+async def search_street(request: Request, body: SearchStreetRequest):
     """
     Fuzzy vyhľadávanie ulice podľa časti názvu (STT výstup z ElevenLabs).
     Cachuje ulice z DB na 5 minút. Vracia max 2 zhody so skóre ≥ 55.
+    Ak prebieha finalizačný timer (user koriguje adresu), zruší ho.
     """
+    # Ak user hovorí o adrese, zruší prípadný pending finalize timer
+    cid = extract_conversation_id(request)
+    if cid and cid in _SESSIONS:
+        cancel_post_summary_finalize(_SESSIONS[cid])
+
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
 
@@ -366,6 +461,8 @@ async def search_street(body: SearchStreetRequest):
 async def vytvor_objednavku(request: Request):
     """
     Endpoint pre ElevenLabs agenta (manage_order tool) na ulozenie objednavky do DB.
+    Idempotentný: druhý call s rovnakým conversation_id nevytvorí duplicitný záznam.
+    Po úspešnom uložení spustí auto-hangup timer (FINALIZE_DELAY_SECONDS).
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
@@ -377,6 +474,19 @@ async def vytvor_objednavku(request: Request):
     except Exception as e:
         print(f"[vytvor-objednavku] validacna chyba: {e}")
         raise HTTPException(status_code=422, detail=str(e))
+
+    # --- IDEMPOTENCIA: ak sme túto objednávku už uložili, vrátime cached success ---
+    cid = extract_conversation_id(request)
+    if cid:
+        session = get_or_create_session(cid)
+        if session.order_finalized:
+            print(f"[vytvor-objednavku] session:{cid} uz finalizovana — preskakujem DB insert")
+            return {"status": "success", "message": "Objednavka uspesne zapisana."}
+        # Nastavíme flag PRED asyncom, aby súbežný request videl finalized=True
+        session.order_finalized = True
+    else:
+        session = None
+        print("[vytvor-objednavku] conversation_id chyba — session tracking preskoceny")
 
     try:
         matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
@@ -400,15 +510,44 @@ async def vytvor_objednavku(request: Request):
 
         supabase.table("pizza_orders").insert(order_data).execute()
 
+        # --- AUTO-HANGUP: po úspešnom uložení naplánuj ukončenie hovoru ---
+        if session and cid:
+            schedule_auto_end_call(session, delay=FINALIZE_DELAY_SECONDS)
+
         return {
             "status": "success",
             "message": "Objednavka uspesne zapisana.",
         }
 
     except Exception as e:
+        # Ak DB zápis zlyhal, resetujeme flag aby mohol byť retry
+        if session:
+            session.order_finalized = False
         error_msg = str(e)
         print(f"DEBUG CHYBA: {error_msg}")
         raise HTTPException(status_code=500, detail=f"Chyba Supabase: {error_msg}")
+
+
+@app.post("/api/end-call")
+async def end_call(request: Request):
+    """
+    ElevenLabs agent tool — zavolá sa keď agent chce ukončiť hovor podľa promptu.
+    Idempotentný: druhý call je no-op (guard cez call_ending flag).
+    Zruší prípadný pending auto-hangup timer (aby nedošlo k dvojitému volaniu API).
+    """
+    cid = extract_conversation_id(request)
+    if cid:
+        session = get_or_create_session(cid)
+        if session.call_ending:
+            print(f"[end-call] session:{cid} uz ukonculavana — preskakujem")
+            return {"status": "ok"}
+        session.call_ending = True
+        cancel_post_summary_finalize(session)
+        print(f"[end-call] session:{cid} hovor sa ukonculava (agent-triggered)")
+    else:
+        print("[end-call] conversation_id chyba — pokracujem bez session")
+
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
