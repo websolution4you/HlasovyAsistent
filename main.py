@@ -76,7 +76,13 @@ AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "swedencentral").strip()
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "").strip()
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://telio-openai-sk-01.openai.azure.com/").strip()
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").strip()
-AZURE_VOICE_LIVE_WS_URL = f"wss://{AZURE_SPEECH_REGION}.voice.speech.microsoft.com/ws/voice-live/v1"
+_openai_resource = AZURE_OPENAI_ENDPOINT.replace("https://", "").replace(".openai.azure.com/", "").replace(".openai.azure.com", "")
+AZURE_VOICE_LIVE_WS_URL = (
+    f"wss://{AZURE_SPEECH_REGION}.voice.speech.microsoft.com/ws/voice-live/v1"
+    f"?api-version=2025-05-15-preview"
+    f"&model-deployment={AZURE_OPENAI_DEPLOYMENT}"
+    f"&openai-resource={_openai_resource}"
+)
 
 PIZZA_SYSTEM_PROMPT = """Si priateľský hlasový asistent Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky pizze.
 Tvoj postup:
@@ -637,7 +643,9 @@ def pcm16k_to_mulaw8k(pcm16k: bytes) -> bytes:
 
 
 def build_azure_session_config(phone_number: str = "") -> dict:
-    """Zostaví konfiguračnú správu pre Azure Voice Live API."""
+    """Zostaví konfiguračnú správu pre Azure Voice Live API.
+    Kľúče NIE sú tu — idú len v WS headers pri pripojení.
+    """
     return {
         "type": "session.update",
         "session": {
@@ -648,44 +656,46 @@ def build_azure_session_config(phone_number: str = "") -> dict:
                 "model": "azure-speech",
                 "language": "sk-SK",
             },
-            "voice": "sk-SK-LukasNeural",
+            "voice": {
+                "name": "sk-SK-LukasNeural",
+                "type": "azure-standard",
+            },
             "instructions": PIZZA_SYSTEM_PROMPT,
             "tools": PIZZA_TOOLS,
             "tool_choice": "auto",
-            "azure": {
-                "speech": {
-                    "region": AZURE_SPEECH_REGION,
-                    "key": AZURE_SPEECH_KEY,
-                },
-                "openai": {
-                    "endpoint": AZURE_OPENAI_ENDPOINT,
-                    "key": AZURE_OPENAI_KEY,
-                    "deployment": AZURE_OPENAI_DEPLOYMENT,
-                },
-            },
         },
     }
 
 
 async def handle_tool_call(tool_name: str, tool_args: dict, phone_number: str) -> str:
-    """Vykoná tool call od Azure agenta — uloží objednávku cez interný HTTP."""
+    """Vykoná tool call od Azure agenta — insertne objednávku priamo cez Supabase."""
     if tool_name == "uloz_objednavku":
         if not tool_args.get("phone_number"):
             tool_args["phone_number"] = phone_number
+        if not supabase:
+            return json.dumps({"status": "error", "message": "Supabase nie je dostupný"})
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    "http://localhost:8000/api/vytvor-objednavku",
-                    json={
-                        "pizza_type": tool_args.get("pizza_type", ""),
-                        "upsell": tool_args.get("upsell", "ziadny"),
-                        "address": tool_args.get("address", ""),
-                        "phone_number": tool_args.get("phone_number", ""),
-                    },
-                )
-            result = resp.json()
-            print(f"[tool] uloz_objednavku -> {resp.status_code} {result}")
-            return json.dumps(result)
+            raw_address = tool_args.get("address", "")
+            matched_address, confidence = match_street(raw_address, TENANT_ID)
+            order_data = {
+                "tenant_id": TENANT_ID,
+                "customer_phone": tool_args.get("phone_number", ""),
+                "phone_raw": tool_args.get("phone_number", ""),
+                "customer_name": "Zákazník",
+                "pizza_type": tool_args.get("pizza_type", ""),
+                "total_price": 0,
+                "delivery_address": matched_address,
+                "address_raw": raw_address,
+                "address_confidence": confidence,
+                "upsell_offered": tool_args.get("upsell", "ziadny") != "ziadny",
+                "upsell_item": tool_args.get("upsell") or None,
+                "upsell_accepted": tool_args.get("upsell", "ziadny") != "ziadny",
+                "notes": None,
+                "status": "NEW",
+            }
+            supabase.table("pizza_orders").insert(order_data).execute()
+            print(f"[tool] uloz_objednavku OK: {order_data}")
+            return json.dumps({"status": "success", "message": "Objednávka uložená."})
         except Exception as e:
             print(f"[tool] uloz_objednavku chyba: {e}")
             return json.dumps({"status": "error", "message": str(e)})
@@ -712,16 +722,29 @@ async def ws_voice(websocket: WebSocket):
 
     try:
         # Otvor spojenie s Azure Voice Live API
-        azure_headers = {"Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY}
-        azure_ws = await websockets.connect(
-            AZURE_VOICE_LIVE_WS_URL,
-            additional_headers=azure_headers,
-            max_size=10 * 1024 * 1024,
-        )
+        azure_headers = {
+            "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
+            "X-OpenAI-Api-Key": AZURE_OPENAI_KEY,
+        }
+        log_url = AZURE_VOICE_LIVE_WS_URL  # URL neobsahuje kľúče, bezpečné logovať
+        print(f"[ws/voice] Pripájam sa na Azure: {log_url}")
+        try:
+            azure_ws = await websockets.connect(
+                AZURE_VOICE_LIVE_WS_URL,
+                additional_headers=azure_headers,
+                max_size=10 * 1024 * 1024,
+            )
+        except Exception as conn_err:
+            import traceback
+            print(f"[ws/voice] Azure WS pripojenie zlyhalo: {conn_err}")
+            traceback.print_exc()
+            raise
         print("[ws/voice] Azure Voice Live pripojeny")
 
         # Pošli konfiguráciu
-        await azure_ws.send(json.dumps(build_azure_session_config(phone_number)))
+        session_cfg = build_azure_session_config(phone_number)
+        print(f"[ws/voice] Posielam session.update: {json.dumps(session_cfg)}")
+        await azure_ws.send(json.dumps(session_cfg))
 
         async def twilio_to_azure():
             """Číta správy od Twilia, konvertuje audio a posiela do Azure."""
