@@ -77,8 +77,10 @@ AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "").strip()
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://telio-openai-sk-01.openai.azure.com/").strip()
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").strip()
 AZURE_VOICE_LIVE_WS_URL = (
-    f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/ws"
-    f"?api-version=2025-05-15-preview"
+    f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/realtime"
+    f"?api-version=2025-10-01"
+    f"&model={AZURE_OPENAI_DEPLOYMENT}"
+    f"&api-key={AZURE_SPEECH_KEY}"
 )
 
 PIZZA_SYSTEM_PROMPT = """Si priateľský hlasový asistent Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky pizze.
@@ -133,6 +135,7 @@ print(f"AZURE_SPEECH_KEY nastavene: {'ano' if bool(AZURE_SPEECH_KEY) else 'nie'}
 print(f"AZURE_OPENAI_KEY nastavene: {'ano' if bool(AZURE_OPENAI_KEY) else 'nie'}")
 print(f"AZURE_SPEECH_REGION: {AZURE_SPEECH_REGION}")
 print(f"AZURE_OPENAI_DEPLOYMENT: {AZURE_OPENAI_DEPLOYMENT}")
+print(f"AZURE_VOICE_LIVE_WS_URL: wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key=***")
 print(f"audioop dostupny: {'ano' if audioop else 'nie'}")
 print("----------------------")
 
@@ -720,10 +723,13 @@ async def ws_voice(websocket: WebSocket):
     try:
         # Otvor spojenie s Azure Voice Live API
         azure_headers = {
-            "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
             "X-OpenAI-Api-Key": AZURE_OPENAI_KEY,
         }
-        log_url = AZURE_VOICE_LIVE_WS_URL  # URL neobsahuje kľúče, bezpečné logovať
+        # Logujeme URL bez api-key
+        log_url = (
+            f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/realtime"
+            f"?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key=***"
+        )
         print(f"[ws/voice] Pripájam sa na Azure: {log_url}")
         try:
             azure_ws = await websockets.connect(
