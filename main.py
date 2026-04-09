@@ -73,11 +73,13 @@ FINALIZE_DELAY_SECONDS = float(os.getenv("FINALIZE_DELAY_SECONDS", "2.0"))
 # --- AZURE VOICE LIVE KONFIG ---
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "").strip()
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "swedencentral").strip()
+AZURE_SPEECH_RESOURCE_NAME = os.getenv("AZURE_SPEECH_RESOURCE_NAME", "pizza-speech").strip()
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "").strip()
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://telio-openai-sk-01.openai.azure.com/").strip()
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").strip()
+# Resource-specific endpoint (nie regionálny) — vyžaduje to Azure Voice Live API
 AZURE_VOICE_LIVE_WS_URL = (
-    f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/realtime"
+    f"wss://{AZURE_SPEECH_RESOURCE_NAME}.cognitiveservices.azure.com/voice-live/realtime"
     f"?api-version=2025-10-01"
     f"&model={AZURE_OPENAI_DEPLOYMENT}"
     f"&api-key={AZURE_SPEECH_KEY}"
@@ -134,8 +136,9 @@ print(f"CORS_ALLOW_ORIGINS: {CORS_ALLOW_ORIGINS}")
 print(f"AZURE_SPEECH_KEY nastavene: {'ano' if bool(AZURE_SPEECH_KEY) else 'nie'}")
 print(f"AZURE_OPENAI_KEY nastavene: {'ano' if bool(AZURE_OPENAI_KEY) else 'nie'}")
 print(f"AZURE_SPEECH_REGION: {AZURE_SPEECH_REGION}")
+print(f"AZURE_SPEECH_RESOURCE_NAME: {AZURE_SPEECH_RESOURCE_NAME}")
 print(f"AZURE_OPENAI_DEPLOYMENT: {AZURE_OPENAI_DEPLOYMENT}")
-print(f"AZURE_VOICE_LIVE_WS_URL: wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key=***")
+print(f"AZURE_VOICE_LIVE_WS_URL: wss://{AZURE_SPEECH_RESOURCE_NAME}.cognitiveservices.azure.com/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key=***")
 print(f"audioop dostupny: {'ano' if audioop else 'nie'}")
 print("----------------------")
 
@@ -728,7 +731,7 @@ async def ws_voice(websocket: WebSocket):
         }
         # Logujeme URL bez api-key
         log_url = (
-            f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/realtime"
+            f"wss://{AZURE_SPEECH_RESOURCE_NAME}.cognitiveservices.azure.com/voice-live/realtime"
             f"?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key=***"
         )
         print(f"[ws/voice] Pripájam sa na Azure: {log_url}")
