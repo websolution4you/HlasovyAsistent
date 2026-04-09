@@ -76,7 +76,9 @@ AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "swedencentral").strip()
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "").strip()
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://telio-openai-sk-01.openai.azure.com/").strip()
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").strip()
-AZURE_VOICE_LIVE_WS_URL = f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key={AZURE_SPEECH_KEY}"
+AZURE_AI_SERVICES_ENDPOINT = os.getenv("AZURE_AI_SERVICES_ENDPOINT", "").strip()
+_ws_base = AZURE_AI_SERVICES_ENDPOINT.rstrip("/").replace("https://", "wss://") if AZURE_AI_SERVICES_ENDPOINT else f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com"
+AZURE_VOICE_LIVE_WS_URL = f"{_ws_base}/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key={AZURE_SPEECH_KEY}"
 
 PIZZA_SYSTEM_PROMPT = """Si priateľský hlasový asistent Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky pizze.
 Tvoj postup:
@@ -130,8 +132,8 @@ print(f"AZURE_SPEECH_KEY nastavene: {'ano' if bool(AZURE_SPEECH_KEY) else 'nie'}
 print(f"AZURE_OPENAI_KEY nastavene: {'ano' if bool(AZURE_OPENAI_KEY) else 'nie'}")
 print(f"AZURE_SPEECH_REGION: {AZURE_SPEECH_REGION}")
 print(f"AZURE_OPENAI_DEPLOYMENT: {AZURE_OPENAI_DEPLOYMENT}")
-_masked_url = f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key={'***' if AZURE_SPEECH_KEY else 'CHYBA-PRAZDNY'}"
-print(f"AZURE_VOICE_LIVE_WS_URL: {_masked_url}")
+print(f"AZURE_AI_SERVICES_ENDPOINT: {AZURE_AI_SERVICES_ENDPOINT or '(nenastaveny, pouziva sa regionalny)'}")
+print(f"AZURE_VOICE_LIVE_WS_URL: {_ws_base}/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key=***")
 print(f"AZURE_SPEECH_KEY dlzka: {len(AZURE_SPEECH_KEY)} znakov")
 print(f"AZURE_OPENAI_KEY dlzka: {len(AZURE_OPENAI_KEY)} znakov")
 print(f"audioop dostupny: {'ano' if audioop else 'nie'}")
@@ -724,7 +726,7 @@ async def ws_voice(websocket: WebSocket):
             "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
             "X-OpenAI-Api-Key": AZURE_OPENAI_KEY,
         }
-        print(f"[ws/voice] Pripájam sa na Azure: wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key=***")
+        print(f"[ws/voice] Pripájam sa na Azure: {_ws_base}/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key=***")
         try:
             azure_ws = await websockets.connect(
                 AZURE_VOICE_LIVE_WS_URL,
