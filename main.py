@@ -2,21 +2,33 @@ import os
 import time
 import asyncio
 import unicodedata
+import json
+import base64
+import struct
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 from rapidfuzz import fuzz, process
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+import websockets
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
+try:
+    import audioop
+except ImportError:
+    try:
+        import audioop_lts as audioop  # type: ignore
+    except ImportError:
+        audioop = None  # type: ignore
+
 # Nacitanie environment premennych (uzitocne pre lokalny vyvoj)
 load_dotenv()
 
-app = FastAPI(title="ElevenLabs Pizza Webhook")
+app = FastAPI(title="Pizza Sicilia Voice Assistant")
 
 
 def _parse_cors_origins() -> list[str]:
@@ -58,6 +70,44 @@ TENANT_ID = os.getenv("TENANT_ID", "").strip()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
 FINALIZE_DELAY_SECONDS = float(os.getenv("FINALIZE_DELAY_SECONDS", "2.0"))
 
+# --- AZURE VOICE LIVE KONFIG ---
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "").strip()
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "swedencentral").strip()
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "").strip()
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://telio-openai-sk-01.openai.azure.com/").strip()
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").strip()
+AZURE_VOICE_LIVE_WS_URL = f"wss://{AZURE_SPEECH_REGION}.voice.speech.microsoft.com/ws/voice-live/v1"
+
+PIZZA_SYSTEM_PROMPT = """Si priateľský hlasový asistent Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky pizze.
+Tvoj postup:
+1. Privítaj zákazníka
+2. Spýtaj sa čo si želá objednať (ponúkni aj nápoje/dezerty ako upsell)
+3. Spýtaj sa na adresu doručenia
+4. Zopakuj objednávku a potvrd ju
+5. Po potvrdení zavolaj funkciu uloz_objednavku
+
+Buď stručný, hovor krátke vety (max 2-3 vety naraz). Ceny: Margherita 6.90€, Šunková 7.50€, Diavola 8.20€, Quattro Formaggi 8.90€. Dovoz zadarmo nad 15€, inak 2€."""
+
+PIZZA_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "uloz_objednavku",
+            "description": "Uloží potvrdenú objednávku pizze do databázy. Volaj až po potvrdení zákazníkom.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pizza_type": {"type": "string", "description": "Typ pizze (napr. Margherita, Diavola)"},
+                    "upsell": {"type": "string", "description": "Doplnkový produkt alebo 'ziadny'"},
+                    "address": {"type": "string", "description": "Adresa doručenia"},
+                    "phone_number": {"type": "string", "description": "Telefónne číslo zákazníka"},
+                },
+                "required": ["pizza_type", "upsell", "address", "phone_number"],
+            },
+        },
+    }
+]
+
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("--- CHYBA KONFIGURACIE ---")
     if not SUPABASE_URL:
@@ -76,6 +126,11 @@ print(f"CORE_SUPABASE_URL nastavene: {'ano' if bool(SUPABASE_URL) else 'nie'}")
 print(f"CORE_SUPABASE_SERVICE_ROLE_KEY nastavene: {'ano' if bool(SUPABASE_KEY) else 'nie'}")
 print(f"TENANT_ID nastavene: {'ano' if bool(TENANT_ID) else 'nie'}")
 print(f"CORS_ALLOW_ORIGINS: {CORS_ALLOW_ORIGINS}")
+print(f"AZURE_SPEECH_KEY nastavene: {'ano' if bool(AZURE_SPEECH_KEY) else 'nie'}")
+print(f"AZURE_OPENAI_KEY nastavene: {'ano' if bool(AZURE_OPENAI_KEY) else 'nie'}")
+print(f"AZURE_SPEECH_REGION: {AZURE_SPEECH_REGION}")
+print(f"AZURE_OPENAI_DEPLOYMENT: {AZURE_OPENAI_DEPLOYMENT}")
+print(f"audioop dostupny: {'ano' if audioop else 'nie'}")
 print("----------------------")
 
 try:
@@ -353,13 +408,22 @@ def health_config():
 
 
 @app.api_route("/twilio/voice", methods=["GET", "POST"])
-async def twilio_voice_webhook():
+async def twilio_voice_webhook(request: Request):
     """
-    Zakladny Twilio voice webhook pre prichadzajuce hovory.
-    Zatial vracia jednoduche TwiML, aby cislo smerovalo na tento projekt.
+    Twilio voice webhook — ak sú Azure kľúče k dispozícii, spustí Media Stream
+    na náš /ws/voice WebSocket. Inak vráti fallback správu.
     """
-    message = os.getenv("TWILIO_VOICE_MESSAGE", DEFAULT_TWILIO_VOICE_MESSAGE).strip()
-    twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    if AZURE_SPEECH_KEY and AZURE_OPENAI_KEY:
+        host = request.headers.get("host", "")
+        twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="wss://{host}/ws/voice" />
+    </Connect>
+</Response>'''
+    else:
+        message = os.getenv("TWILIO_VOICE_MESSAGE", DEFAULT_TWILIO_VOICE_MESSAGE).strip()
+        twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="Polly.Vlasta" language="sk-SK">{message}</Say>
     <Pause length="1"/>
@@ -548,6 +612,231 @@ async def end_call(request: Request):
         print("[end-call] conversation_id chyba — pokracujem bez session")
 
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# AUDIO KONVERZIA: mulaw 8kHz (Twilio) ↔ PCM 16kHz (Azure Voice Live)
+# ---------------------------------------------------------------------------
+
+def mulaw8k_to_pcm16k(mulaw_bytes: bytes) -> bytes:
+    """Konvertuje mulaw 8kHz na PCM 16kHz (linear16, little-endian)."""
+    if audioop is None:
+        # Bez audioop: len upsamplujeme bez ulaw dekódovania (núdzový fallback)
+        return mulaw_bytes * 2
+    pcm8k = audioop.ulaw2lin(mulaw_bytes, 2)        # mulaw -> PCM 16-bit 8kHz
+    pcm16k, _ = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, None)  # 8kHz -> 16kHz
+    return pcm16k
+
+
+def pcm16k_to_mulaw8k(pcm16k: bytes) -> bytes:
+    """Konvertuje PCM 16kHz na mulaw 8kHz pre Twilio."""
+    if audioop is None:
+        return pcm16k[:len(pcm16k)//2]
+    pcm8k, _ = audioop.ratecv(pcm16k, 2, 1, 16000, 8000, None)  # 16kHz -> 8kHz
+    return audioop.lin2ulaw(pcm8k, 2)               # PCM -> mulaw
+
+
+def build_azure_session_config(phone_number: str = "") -> dict:
+    """Zostaví konfiguračnú správu pre Azure Voice Live API."""
+    return {
+        "type": "session.update",
+        "session": {
+            "turn_detection": {"type": "server_vad"},
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+            "input_audio_transcription": {
+                "model": "azure-speech",
+                "language": "sk-SK",
+            },
+            "voice": "sk-SK-LukasNeural",
+            "instructions": PIZZA_SYSTEM_PROMPT,
+            "tools": PIZZA_TOOLS,
+            "tool_choice": "auto",
+            "azure": {
+                "speech": {
+                    "region": AZURE_SPEECH_REGION,
+                    "key": AZURE_SPEECH_KEY,
+                },
+                "openai": {
+                    "endpoint": AZURE_OPENAI_ENDPOINT,
+                    "key": AZURE_OPENAI_KEY,
+                    "deployment": AZURE_OPENAI_DEPLOYMENT,
+                },
+            },
+        },
+    }
+
+
+async def handle_tool_call(tool_name: str, tool_args: dict, phone_number: str) -> str:
+    """Vykoná tool call od Azure agenta — uloží objednávku cez interný HTTP."""
+    if tool_name == "uloz_objednavku":
+        if not tool_args.get("phone_number"):
+            tool_args["phone_number"] = phone_number
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    "http://localhost:8000/api/vytvor-objednavku",
+                    json={
+                        "pizza_type": tool_args.get("pizza_type", ""),
+                        "upsell": tool_args.get("upsell", "ziadny"),
+                        "address": tool_args.get("address", ""),
+                        "phone_number": tool_args.get("phone_number", ""),
+                    },
+                )
+            result = resp.json()
+            print(f"[tool] uloz_objednavku -> {resp.status_code} {result}")
+            return json.dumps(result)
+        except Exception as e:
+            print(f"[tool] uloz_objednavku chyba: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+    return json.dumps({"status": "error", "message": f"Neznámy tool: {tool_name}"})
+
+
+# ---------------------------------------------------------------------------
+# WebSocket endpoint: Twilio Media Streams ↔ Azure Voice Live API
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/voice")
+async def ws_voice(websocket: WebSocket):
+    """
+    Prijíma Twilio Media Stream (mulaw 8kHz) a prepája ho na Azure Voice Live API.
+    Konvertuje audio oboma smermi a spracúva function calling (uloz_objednavku).
+    """
+    await websocket.accept()
+    print("[ws/voice] Twilio pripojeny")
+
+    stream_sid: Optional[str] = None
+    phone_number: str = ""
+    azure_ws = None
+    pending_tool_calls: dict = {}  # call_id -> {name, args_acc}
+
+    try:
+        # Otvor spojenie s Azure Voice Live API
+        azure_headers = {"Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY}
+        azure_ws = await websockets.connect(
+            AZURE_VOICE_LIVE_WS_URL,
+            additional_headers=azure_headers,
+            max_size=10 * 1024 * 1024,
+        )
+        print("[ws/voice] Azure Voice Live pripojeny")
+
+        # Pošli konfiguráciu
+        await azure_ws.send(json.dumps(build_azure_session_config(phone_number)))
+
+        async def twilio_to_azure():
+            """Číta správy od Twilia, konvertuje audio a posiela do Azure."""
+            nonlocal stream_sid, phone_number
+            while True:
+                try:
+                    raw = await websocket.receive_text()
+                except WebSocketDisconnect:
+                    print("[ws/voice] Twilio odpojil")
+                    return
+                msg = json.loads(raw)
+                event = msg.get("event")
+
+                if event == "start":
+                    stream_sid = msg["start"].get("streamSid", "")
+                    phone_number = (
+                        msg["start"]
+                        .get("customParameters", {})
+                        .get("phone_number", "")
+                        or msg["start"].get("from", "")
+                    )
+                    print(f"[ws/voice] stream started sid={stream_sid} phone={phone_number}")
+                    # Aktualizuj session s telefónom ak ho máme
+                    if phone_number:
+                        await azure_ws.send(json.dumps(build_azure_session_config(phone_number)))
+
+                elif event == "media":
+                    mulaw_b64 = msg["media"]["payload"]
+                    mulaw_bytes = base64.b64decode(mulaw_b64)
+                    pcm16k = mulaw8k_to_pcm16k(mulaw_bytes)
+                    pcm_b64 = base64.b64encode(pcm16k).decode()
+                    await azure_ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": pcm_b64,
+                    }))
+
+                elif event == "stop":
+                    print("[ws/voice] Twilio stream stop")
+                    return
+
+        async def azure_to_twilio():
+            """Číta správy od Azure, konvertuje audio a posiela späť do Twilia."""
+            nonlocal pending_tool_calls
+            while True:
+                try:
+                    raw = await azure_ws.recv()
+                except Exception as e:
+                    print(f"[ws/voice] Azure WS ukončil: {e}")
+                    return
+
+                msg = json.loads(raw)
+                msg_type = msg.get("type", "")
+
+                if msg_type == "response.audio.delta":
+                    # Azure posiela PCM 16kHz audio delta
+                    pcm16k = base64.b64decode(msg.get("delta", ""))
+                    if pcm16k:
+                        mulaw8k = pcm16k_to_mulaw8k(pcm16k)
+                        mulaw_b64 = base64.b64encode(mulaw8k).decode()
+                        if stream_sid:
+                            await websocket.send_text(json.dumps({
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {"payload": mulaw_b64},
+                            }))
+
+                elif msg_type == "response.function_call_arguments.delta":
+                    call_id = msg.get("call_id", "")
+                    if call_id not in pending_tool_calls:
+                        pending_tool_calls[call_id] = {
+                            "name": msg.get("name", ""),
+                            "args_acc": "",
+                        }
+                    pending_tool_calls[call_id]["args_acc"] += msg.get("delta", "")
+
+                elif msg_type == "response.function_call_arguments.done":
+                    call_id = msg.get("call_id", "")
+                    tool_name = msg.get("name", "") or pending_tool_calls.get(call_id, {}).get("name", "")
+                    args_str = msg.get("arguments", "") or pending_tool_calls.get(call_id, {}).get("args_acc", "{}")
+                    pending_tool_calls.pop(call_id, None)
+
+                    try:
+                        tool_args = json.loads(args_str)
+                    except Exception:
+                        tool_args = {}
+
+                    print(f"[ws/voice] tool_call name={tool_name} args={tool_args}")
+                    result_str = await handle_tool_call(tool_name, tool_args, phone_number)
+
+                    # Pošli výsledok toolcallu späť do Azure
+                    await azure_ws.send(json.dumps({
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": result_str,
+                        },
+                    }))
+                    await azure_ws.send(json.dumps({"type": "response.create"}))
+
+                elif msg_type == "error":
+                    print(f"[ws/voice] Azure chyba: {msg}")
+
+        # Spusti oba smery súbežne
+        await asyncio.gather(twilio_to_azure(), azure_to_twilio())
+
+    except Exception as e:
+        print(f"[ws/voice] chyba: {e}")
+    finally:
+        if azure_ws:
+            try:
+                await azure_ws.close()
+            except Exception:
+                pass
+        print("[ws/voice] spojenie ukončené")
 
 
 if __name__ == "__main__":

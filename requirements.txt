@@ -1,8 +1,10 @@
 fastapi
-uvicorn
+uvicorn[standard]
 supabase
 pydantic
 python-dotenv
 python-multipart
 rapidfuzz
 httpx
+websockets
+audioop-lts
