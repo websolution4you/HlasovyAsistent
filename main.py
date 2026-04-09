@@ -93,19 +93,17 @@ Buď stručný, hovor krátke vety (max 2-3 vety naraz). Ceny: Margherita 6.90�
 PIZZA_TOOLS = [
     {
         "type": "function",
-        "function": {
-            "name": "uloz_objednavku",
-            "description": "Uloží potvrdenú objednávku pizze do databázy. Volaj až po potvrdení zákazníkom.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pizza_type": {"type": "string", "description": "Typ pizze (napr. Margherita, Diavola)"},
-                    "upsell": {"type": "string", "description": "Doplnkový produkt alebo 'ziadny'"},
-                    "address": {"type": "string", "description": "Adresa doručenia"},
-                    "phone_number": {"type": "string", "description": "Telefónne číslo zákazníka"},
-                },
-                "required": ["pizza_type", "upsell", "address", "phone_number"],
+        "name": "uloz_objednavku",
+        "description": "Uloží potvrdenú objednávku pizze do databázy. Volaj až po potvrdení zákazníkom.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pizza_type": {"type": "string", "description": "Typ pizze (napr. Margherita, Diavola)"},
+                "upsell": {"type": "string", "description": "Doplnkový produkt alebo 'ziadny'"},
+                "address": {"type": "string", "description": "Adresa doručenia"},
+                "phone_number": {"type": "string", "description": "Telefónne číslo zákazníka"},
             },
+            "required": ["pizza_type", "upsell", "address", "phone_number"],
         },
     }
 ]
@@ -766,9 +764,6 @@ async def ws_voice(websocket: WebSocket):
                         or msg["start"].get("from", "")
                     )
                     print(f"[ws/voice] stream started sid={stream_sid} phone={phone_number}")
-                    # Aktualizuj session s telefónom ak ho máme
-                    if phone_number:
-                        await azure_ws.send(json.dumps(build_azure_session_config(phone_number)))
 
                 elif event == "media":
                     mulaw_b64 = msg["media"]["payload"]
