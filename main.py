@@ -723,6 +723,7 @@ async def ws_voice(websocket: WebSocket):
     try:
         # Otvor spojenie s Azure Voice Live API
         azure_headers = {
+            "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
             "X-OpenAI-Api-Key": AZURE_OPENAI_KEY,
         }
         # Logujeme URL bez api-key
