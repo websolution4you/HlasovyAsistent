@@ -76,12 +76,9 @@ AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "swedencentral").strip()
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "").strip()
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://telio-openai-sk-01.openai.azure.com/").strip()
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").strip()
-_openai_resource = AZURE_OPENAI_ENDPOINT.replace("https://", "").replace(".openai.azure.com/", "").replace(".openai.azure.com", "")
 AZURE_VOICE_LIVE_WS_URL = (
-    f"wss://{AZURE_SPEECH_REGION}.voice.speech.microsoft.com/ws/voice-live/v1"
+    f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/voice-live/ws"
     f"?api-version=2025-05-15-preview"
-    f"&model-deployment={AZURE_OPENAI_DEPLOYMENT}"
-    f"&openai-resource={_openai_resource}"
 )
 
 PIZZA_SYSTEM_PROMPT = """Si priateľský hlasový asistent Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky pizze.
