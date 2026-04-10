@@ -16,6 +16,8 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from openai import AzureOpenAI
+from google import genai
+from google.genai import types
 
 try:
     import audioop
@@ -89,6 +91,10 @@ AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").st
 AZURE_AI_SERVICES_ENDPOINT = os.getenv("AZURE_AI_SERVICES_ENDPOINT", "").strip()
 _ws_base = AZURE_AI_SERVICES_ENDPOINT.rstrip("/").replace("https://", "wss://") if AZURE_AI_SERVICES_ENDPOINT else f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com"
 AZURE_VOICE_LIVE_WS_URL = f"{_ws_base}/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key={AZURE_SPEECH_KEY}"
+
+# --- GEMINI LIVE API KONFIG ---
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+GEMINI_MODEL = "gemini-2.0-flash-exp"
 
 _prompt_path = os.path.join(os.path.dirname(__file__), "prompt.txt")
 PIZZA_SYSTEM_PROMPT_BASE = open(_prompt_path, encoding="utf-8").read().strip()
@@ -169,6 +175,8 @@ print(f"PIPELINE_VERSION: {PIPELINE_VERSION}")
 print(f"DEEPGRAM_API_KEY nastavene: {'ano' if bool(DEEPGRAM_API_KEY) else 'nie'}")
 print(f"GOOGLE_TTS_API_KEY nastavene: {'ano' if bool(GOOGLE_TTS_API_KEY) else 'nie'}")
 print(f"GOOGLE_TTS_VOICE: {GOOGLE_TTS_VOICE}")
+print(f"GOOGLE_API_KEY nastavene: {'ano' if bool(GOOGLE_API_KEY) else 'nie'}")
+print(f"GEMINI_MODEL: {GEMINI_MODEL}")
 print("----------------------")
 
 try:
@@ -356,10 +364,21 @@ async def twilio_voice_webhook(request: Request):
     Twilio voice webhook — vyberá pipeline podľa PIPELINE_VERSION env premennej.
     'azure'  → /ws/voice  (Azure Voice Live)
     'custom' → /ws/voice-v2 (Deepgram + GPT-4.1 + Google TTS)
+    'gemini' → /ws/voice-gemini (Gemini Live API)
     """
     host = request.headers.get("host", "")
 
-    if PIPELINE_VERSION == "custom" and DEEPGRAM_API_KEY and AZURE_OPENAI_KEY and GOOGLE_TTS_API_KEY:
+    if PIPELINE_VERSION == "gemini" and GOOGLE_API_KEY:
+        ws_endpoint = f"wss://{host}/ws/voice-gemini"
+        twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{ws_endpoint}">
+            <Parameter name="phone_number" value="{{{{From}}}}" />
+        </Stream>
+    </Connect>
+</Response>'''
+    elif PIPELINE_VERSION == "custom" and DEEPGRAM_API_KEY and AZURE_OPENAI_KEY and GOOGLE_TTS_API_KEY:
         ws_endpoint = f"wss://{host}/ws/voice-v2"
         twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -1139,6 +1158,226 @@ async def ws_voice_v2(websocket: WebSocket):
             except Exception:
                 pass
         print("[ws/voice-v2] spojenie ukončené")
+
+
+# ---------------------------------------------------------------------------
+# /ws/voice-gemini: Gemini Live API pipeline
+# ---------------------------------------------------------------------------
+
+def _build_gemini_tools() -> list:
+    """Konvertuje PIZZA_TOOLS na Gemini Live API formát (types.FunctionDeclaration)."""
+    gemini_tools = []
+    for tool in PIZZA_TOOLS:
+        # Konvertuj properties na Gemini formát
+        properties = {}
+        for prop_name, prop_def in tool["parameters"]["properties"].items():
+            properties[prop_name] = types.Schema(
+                type=types.Type.STRING if prop_def["type"] == "string" else types.Type.NUMBER,
+                description=prop_def.get("description", "")
+            )
+        
+        gemini_tools.append(
+            types.FunctionDeclaration(
+                name=tool["name"],
+                description=tool["description"],
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties=properties,
+                    required=tool["parameters"].get("required", [])
+                )
+            )
+        )
+    return gemini_tools
+
+
+@app.websocket("/ws/voice-gemini")
+async def ws_voice_gemini(websocket: WebSocket):
+    """
+    Gemini Live API pipeline: Twilio mulaw 8kHz ↔ Gemini Live API (WebSocket).
+    Architektúra: jeden WebSocket, žiadny pipeline (STT+LLM+TTS v jednom).
+    """
+    await websocket.accept()
+    print("[ws/voice-gemini] Twilio pripojený")
+
+    stream_sid: Optional[str] = None
+    phone_number: str = ""
+    transcript_lines: list = []
+    gemini_session = None
+
+    try:
+        # Načítaj menu a system prompt
+        menu_text = format_menu_from_db(TENANT_ID)
+        system_instructions = PIZZA_SYSTEM_PROMPT_BASE + "\n\n" + (menu_text if menu_text else PIZZA_MENU_FALLBACK)
+
+        # Inicializuj Gemini klienta
+        client = genai.Client(api_key=GOOGLE_API_KEY)
+
+        # Konfigurácia Gemini Live session
+        config = types.LiveConnectConfig(
+            response_modalities=["AUDIO"],
+            system_instruction=types.Content(
+                parts=[types.Part(text=system_instructions)]
+            ),
+            tools=_build_gemini_tools(),
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Kore"  # Gemini Live voice
+                    )
+                )
+            ),
+        )
+
+        print(f"[ws/voice-gemini] Pripájam sa na Gemini Live API model={GEMINI_MODEL}")
+        gemini_session = await client.aio.live.connect(model=GEMINI_MODEL, config=config).__aenter__()
+        print("[ws/voice-gemini] Gemini Live API pripojený")
+
+        async def twilio_to_gemini():
+            """Číta audio z Twilia (mulaw 8kHz), konvertuje na PCM 16kHz a posiela do Gemini."""
+            nonlocal stream_sid, phone_number
+            while True:
+                try:
+                    raw = await websocket.receive_text()
+                except WebSocketDisconnect:
+                    print("[ws/voice-gemini] Twilio odpojil")
+                    return
+                
+                msg = json.loads(raw)
+                event = msg.get("event")
+
+                if event == "start":
+                    stream_sid = msg["start"].get("streamSid", "")
+                    phone_number = (
+                        msg["start"]
+                        .get("customParameters", {})
+                        .get("phone_number", "")
+                        or msg["start"].get("from", "")
+                    )
+                    print(f"[ws/voice-gemini] stream started sid={stream_sid} phone={phone_number}")
+
+                elif event == "media":
+                    # Twilio → mulaw 8kHz → PCM 16kHz → Gemini
+                    mulaw_b64 = msg["media"]["payload"]
+                    mulaw_bytes = base64.b64decode(mulaw_b64)
+                    pcm16k = mulaw8k_to_pcm16k(mulaw_bytes)
+                    
+                    # Pošli do Gemini Live API
+                    try:
+                        await gemini_session.send(
+                            types.LiveClientRealtimeInput(
+                                media_chunks=[
+                                    types.Blob(
+                                        data=pcm16k,
+                                        mime_type="audio/pcm;rate=16000"
+                                    )
+                                ]
+                            )
+                        )
+                    except Exception as e:
+                        print(f"[ws/voice-gemini] Gemini send error: {e}")
+                        return
+
+                elif event == "stop":
+                    print("[ws/voice-gemini] Twilio stream stop")
+                    return
+
+        async def gemini_to_twilio():
+            """Číta odpovede z Gemini Live API a posiela audio späť do Twilia."""
+            nonlocal transcript_lines
+            
+            try:
+                async for response in gemini_session.receive():
+                    # Audio data od Gemini (PCM 16kHz)
+                    if hasattr(response, 'data') and response.data:
+                        # Gemini vracia PCM 16kHz → konvertuj na mulaw 8kHz pre Twilio
+                        pcm16k = response.data
+                        mulaw8k = pcm16k_to_mulaw8k(pcm16k)
+                        mulaw_b64 = base64.b64encode(mulaw8k).decode()
+                        
+                        if stream_sid:
+                            await websocket.send_text(json.dumps({
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {"payload": mulaw_b64},
+                            }))
+
+                    # Server content (text, tool calls, atď.)
+                    if hasattr(response, 'server_content') and response.server_content:
+                        server_content = response.server_content
+                        
+                        # Model turn (text response)
+                        if hasattr(server_content, 'model_turn') and server_content.model_turn:
+                            for part in server_content.model_turn.parts:
+                                # Text transcript
+                                if hasattr(part, 'text') and part.text:
+                                    text = part.text.strip()
+                                    if text:
+                                        transcript_lines.append(f"Agent: {text}")
+                                        print(f"[gemini/transcript] Agent: {text}")
+                                
+                                # Function call
+                                if hasattr(part, 'function_call') and part.function_call:
+                                    fc = part.function_call
+                                    tool_name = fc.name
+                                    tool_args = dict(fc.args) if hasattr(fc, 'args') else {}
+                                    
+                                    print(f"[gemini/tool_call] name={tool_name} args={tool_args}")
+                                    result_str = await handle_tool_call(
+                                        tool_name, tool_args, phone_number, transcript_lines
+                                    )
+                                    
+                                    # Pošli výsledok tool callu späť do Gemini
+                                    result_data = json.loads(result_str)
+                                    await gemini_session.send(
+                                        types.LiveClientToolResponse(
+                                            function_responses=[
+                                                types.FunctionResponse(
+                                                    name=tool_name,
+                                                    response=result_data
+                                                )
+                                            ]
+                                        )
+                                    )
+                                    
+                                    # Ak je to ukonci_hovor, zavri spojenie
+                                    if tool_name == "ukonci_hovor":
+                                        await asyncio.sleep(3)
+                                        print("[ws/voice-gemini] ukonci_hovor — zatvaram spojenie")
+                                        await websocket.close()
+                                        return
+
+                        # Turn complete
+                        if hasattr(server_content, 'turn_complete') and server_content.turn_complete:
+                            print("[gemini] Turn complete")
+
+                    # User transcript (input audio transcription)
+                    if hasattr(response, 'tool_call') and response.tool_call:
+                        # Spracované vyššie v server_content
+                        pass
+
+            except Exception as e:
+                print(f"[ws/voice-gemini] Gemini receive error: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+
+        # Spusti oba smery súbežne
+        await asyncio.gather(
+            twilio_to_gemini(),
+            gemini_to_twilio(),
+        )
+
+    except Exception as e:
+        print(f"[ws/voice-gemini] chyba: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if gemini_session:
+            try:
+                await gemini_session.__aexit__(None, None, None)
+            except Exception:
+                pass
+        print("[ws/voice-gemini] spojenie ukončené")
 
 
 if __name__ == "__main__":

@@ -9,3 +9,4 @@ httpx
 websockets
 audioop-lts
 openai
+google-genai
