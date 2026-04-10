@@ -828,142 +828,134 @@ async def _gpt_stream_and_tts(
     stream_sid: str,
     phone_number: str,
     transcript_lines: list,
+    gpt_lock: asyncio.Lock,
 ) -> list:
     """
     Zavolá GPT-4.1 (Azure) streaming, posielá text chunky do ElevenLabs,
     spracuje tool cally. Vráti aktualizovaný messages list.
-    """
-    azure_client = AzureOpenAI(
-        api_key=AZURE_OPENAI_KEY,
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_version="2025-01-01-preview",
-    )
 
-    # Iteratívna slučka pre tool cally
-    while True:
-        stream = azure_client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,
-            messages=messages,
-            tools=PIZZA_TOOLS_OPENAI,
-            tool_choice="auto",
-            stream=True,
+    DÔLEŽITÉ: el_ws zostáva otvorený počas celého hovoru — {"text": ""} sa
+    posiela LEN pri ukonci_hovor. Medzi turnmi sa WS nezatvára.
+    gpt_lock zabraňuje súbežným GPT volaniam na ten istý el_ws.
+    """
+    async with gpt_lock:
+        azure_client = AzureOpenAI(
+            api_key=AZURE_OPENAI_KEY,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            api_version="2025-01-01-preview",
         )
 
-        # Akumulátory pre streamed odpoveď
-        assistant_text_chunks: list[str] = []
-        tool_calls_acc: dict = {}   # index -> {id, name, args}
-        chunk_buffer = ""           # buffer pre ElevenLabs (flush po 2+ slovách)
-
-        for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if delta is None:
-                continue
-
-            # Textový obsah → buffer → ElevenLabs
-            if delta.content:
-                text = delta.content
-                assistant_text_chunks.append(text)
-                chunk_buffer += text
-
-                # Flush keď máme aspoň 2 slová alebo chunk je dlhší ako 30 znakov
-                words = chunk_buffer.split()
-                if len(words) >= 2 or len(chunk_buffer) >= 30:
-                    await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
-                    chunk_buffer = ""
-
-            # Tool call accumulation
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {"id": "", "name": "", "args": ""}
-                    if tc.id:
-                        tool_calls_acc[idx]["id"] = tc.id
-                    if tc.function and tc.function.name:
-                        tool_calls_acc[idx]["name"] = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        tool_calls_acc[idx]["args"] += tc.function.arguments
-
-        # Flush zvyšok buffra
-        if chunk_buffer.strip():
-            await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
+        async def _stream_to_elevenlabs(gpt_stream) -> tuple[str, dict]:
+            """Streamuje GPT odpoveď do ElevenLabs, vracia (text, tool_calls_acc)."""
+            assistant_text_chunks: list[str] = []
+            tool_calls_acc: dict = {}
             chunk_buffer = ""
 
-        # Signál konca vstupu ElevenLabs
-        await el_ws.send(json.dumps({"text": ""}))
+            for chunk in gpt_stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta is None:
+                    continue
 
-        assistant_content = "".join(assistant_text_chunks)
-        if assistant_content:
-            transcript_lines.append(f"Agent: {assistant_content}")
-            print(f"[v2/transcript] Agent: {assistant_content}")
+                if delta.content:
+                    text = delta.content
+                    assistant_text_chunks.append(text)
+                    chunk_buffer += text
+                    # Flush po ~5 slovách alebo 50 znakoch — menej trhané ako 2 slová
+                    if len(chunk_buffer.split()) >= 5 or len(chunk_buffer) >= 50:
+                        await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
+                        chunk_buffer = ""
 
-        # Žiadne tool cally — koniec
-        if not tool_calls_acc:
-            if assistant_content:
-                messages.append({"role": "assistant", "content": assistant_content})
-            return messages
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {"id": "", "name": "", "args": ""}
+                        if tc.id:
+                            tool_calls_acc[idx]["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            tool_calls_acc[idx]["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            tool_calls_acc[idx]["args"] += tc.function.arguments
 
-        # Spracuj tool cally
-        tool_call_items = []
-        for idx in sorted(tool_calls_acc.keys()):
-            tc = tool_calls_acc[idx]
-            tool_call_items.append({
-                "id": tc["id"],
-                "type": "function",
-                "function": {"name": tc["name"], "arguments": tc["args"]},
-            })
+            # Flush zvyšok
+            if chunk_buffer.strip():
+                await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
 
-        messages.append({
-            "role": "assistant",
-            "content": assistant_content or None,
-            "tool_calls": tool_call_items,
-        })
+            return "".join(assistant_text_chunks), tool_calls_acc
 
-        # Vykonaj každý tool a pridaj výsledok do messages
-        should_hangup = False
-        for tc_item in tool_call_items:
-            tool_name = tc_item["function"]["name"]
-            try:
-                tool_args = json.loads(tc_item["function"]["arguments"])
-            except Exception:
-                tool_args = {}
-
-            print(f"[v2/tool_call] name={tool_name} args={tool_args}")
-            result_str = await handle_tool_call(tool_name, tool_args, phone_number, transcript_lines)
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc_item["id"],
-                "content": result_str,
-            })
-
-            if tool_name == "ukonci_hovor":
-                should_hangup = True
-
-        if should_hangup:
-            # Nechaj GPT dohovoriť rozlúčku — jeden ďalší turn
-            stream2 = azure_client.chat.completions.create(
+        # Iteratívna slučka pre tool cally
+        while True:
+            stream = azure_client.chat.completions.create(
                 model=AZURE_OPENAI_DEPLOYMENT,
                 messages=messages,
+                tools=PIZZA_TOOLS_OPENAI,
+                tool_choice="auto",
                 stream=True,
             )
-            farewell_buf = ""
-            for chunk in stream2:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    farewell_buf += delta.content
-                    words = farewell_buf.split()
-                    if len(words) >= 2 or len(farewell_buf) >= 30:
-                        await el_ws.send(json.dumps({"text": farewell_buf, "flush": True}))
-                        farewell_buf = ""
-            if farewell_buf.strip():
-                await el_ws.send(json.dumps({"text": farewell_buf, "flush": True}))
-            await el_ws.send(json.dumps({"text": ""}))
-            await asyncio.sleep(3)
-            await twilio_ws.close()
-            return messages
 
-        # Pokračuj v slučke (GPT dostane výsledky toolov)
+            assistant_content, tool_calls_acc = await _stream_to_elevenlabs(stream)
+
+            if assistant_content:
+                transcript_lines.append(f"Agent: {assistant_content}")
+                print(f"[v2/transcript] Agent: {assistant_content}")
+
+            # Žiadne tool cally — bežný turn hotový, WS zostáva otvorený
+            if not tool_calls_acc:
+                if assistant_content:
+                    messages.append({"role": "assistant", "content": assistant_content})
+                return messages
+
+            # Spracuj tool cally
+            tool_call_items = []
+            for idx in sorted(tool_calls_acc.keys()):
+                tc = tool_calls_acc[idx]
+                tool_call_items.append({
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["args"]},
+                })
+
+            messages.append({
+                "role": "assistant",
+                "content": assistant_content or None,
+                "tool_calls": tool_call_items,
+            })
+
+            should_hangup = False
+            for tc_item in tool_call_items:
+                tool_name = tc_item["function"]["name"]
+                try:
+                    tool_args = json.loads(tc_item["function"]["arguments"])
+                except Exception:
+                    tool_args = {}
+
+                print(f"[v2/tool_call] name={tool_name} args={tool_args}")
+                result_str = await handle_tool_call(tool_name, tool_args, phone_number, transcript_lines)
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_item["id"],
+                    "content": result_str,
+                })
+
+                if tool_name == "ukonci_hovor":
+                    should_hangup = True
+
+            if should_hangup:
+                # Rozlúčkový turn
+                stream2 = azure_client.chat.completions.create(
+                    model=AZURE_OPENAI_DEPLOYMENT,
+                    messages=messages,
+                    stream=True,
+                )
+                await _stream_to_elevenlabs(stream2)
+                # Teraz zatvor ElevenLabs stream — koniec hovoru
+                await el_ws.send(json.dumps({"text": ""}))
+                await asyncio.sleep(3)
+                await twilio_ws.close()
+                return messages
+
+            # Pokračuj v slučke (GPT dostane výsledky toolov)
 
 
 @app.websocket("/ws/voice-v2")
@@ -978,6 +970,7 @@ async def ws_voice_v2(websocket: WebSocket):
     stream_sid: Optional[str] = None
     phone_number: str = ""
     transcript_lines: list = []
+    gpt_lock = asyncio.Lock()  # len jeden GPT+TTS turn naraz
 
     # Konverzačný stav pre GPT
     menu_text = format_menu_from_db(TENANT_ID)
@@ -1055,7 +1048,7 @@ async def ws_voice_v2(websocket: WebSocket):
 
                     # Pozdravný turn — agent začína hovor
                     asyncio.ensure_future(
-                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines)
+                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
                     )
 
                 elif event == "media":
@@ -1128,7 +1121,7 @@ async def ws_voice_v2(websocket: WebSocket):
                     messages.append({"role": "user", "content": full_transcript})
 
                     asyncio.ensure_future(
-                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines)
+                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
                     )
 
         async def elevenlabs_to_twilio():
