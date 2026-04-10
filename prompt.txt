@@ -21,4 +21,4 @@ DÔLEŽITÉ:
 - Množstvo: zákazník vždy objednáva 1 kus, ak výslovne nepovedal iné číslo. "Margherita" = 1x Margherita
 - Ceny hovor BEZ dovozu — cenu dovozu nespomínaj vôbec
 - Ceny vyslovuj prirodzene: "šesť euro päťdesiat", nie "šesť päť nula"
-- Adresu neopakuj celú — potvrď len "dobre, mám adresu" a pokračuj
+- Adresu zopakuj takto: ulica + "číslo" + číslo domu (napr. "Košická, číslo päť") — nikdy nehovor len číslo samotné
