@@ -651,7 +651,7 @@ def build_azure_session_config(phone_number: str = "") -> dict:
         "session": {
             "turn_detection": {"type": "azure_semantic_vad"},
             "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
+            "output_audio_format": "g711_ulaw",  # 8kHz mulaw — priamo Twilio formát, bez konverzie
             "input_audio_transcription": {
                 "model": "azure-speech",
                 "language": "sk-SK",
@@ -806,17 +806,14 @@ async def ws_voice(websocket: WebSocket):
                 msg_type = msg.get("type", "")
 
                 if msg_type == "response.audio.delta":
-                    # Azure posiela PCM 16kHz audio delta
-                    pcm16k = base64.b64decode(msg.get("delta", ""))
-                    if pcm16k:
-                        mulaw8k = pcm16k_to_mulaw8k(pcm16k)
-                        mulaw_b64 = base64.b64encode(mulaw8k).decode()
-                        if stream_sid:
-                            await websocket.send_text(json.dumps({
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": mulaw_b64},
-                            }))
+                    # Azure posiela g711_ulaw 8kHz — priamo Twilio formát, bez konverzie
+                    delta_b64 = msg.get("delta", "")
+                    if delta_b64 and stream_sid:
+                        await websocket.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": delta_b64},
+                        }))
 
                 elif msg_type == "response.function_call_arguments.delta":
                     call_id = msg.get("call_id", "")
