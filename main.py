@@ -80,7 +80,9 @@ AZURE_AI_SERVICES_ENDPOINT = os.getenv("AZURE_AI_SERVICES_ENDPOINT", "").strip()
 _ws_base = AZURE_AI_SERVICES_ENDPOINT.rstrip("/").replace("https://", "wss://") if AZURE_AI_SERVICES_ENDPOINT else f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com"
 AZURE_VOICE_LIVE_WS_URL = f"{_ws_base}/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key={AZURE_SPEECH_KEY}"
 
-PIZZA_SYSTEM_PROMPT = """Si priateľský hlasový asistent Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky pizze.
+PIZZA_SYSTEM_PROMPT = """Hovor prirodzene, priateľsky a svižne. Nepoužívaj dlhé vety.
+
+Si priateľský hlasový asistent Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky pizze.
 Tvoj postup:
 1. Privítaj zákazníka
 2. Spýtaj sa čo si želá objednať (ponúkni aj nápoje/dezerty ako upsell)
@@ -647,17 +649,28 @@ def build_azure_session_config(phone_number: str = "") -> dict:
     return {
         "type": "session.update",
         "session": {
-            "turn_detection": {"type": "server_vad"},
+            "turn_detection": {"type": "azure_semantic_vad"},
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
             "input_audio_transcription": {
                 "model": "azure-speech",
                 "language": "sk-SK",
             },
-            "voice": {
-                "name": "sk-SK-LukasNeural",
-                "type": "azure-standard",
+            "input_audio_noise_reduction": {
+                "type": "azure_deep_noise_suppression"
             },
+            # Aktívny hlas: multilingual HD — prirodzenejší, podporuje slovenčinu
+            "voice": {
+                "name": "en-US-Andrew:DragonHDLatestNeural",
+                "type": "azure-standard",
+                "temperature": 0.8,
+            },
+            # Záložný hlas: natívny slovenský (menej prirodzený)
+            # "voice": {
+            #     "name": "sk-SK-LukasNeural",
+            #     "type": "azure-standard",
+            #     "rate": "1.1",
+            # },
             "instructions": PIZZA_SYSTEM_PROMPT,
             "tools": PIZZA_TOOLS,
             "tool_choice": "auto",
