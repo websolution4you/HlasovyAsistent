@@ -13,6 +13,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from openai import AzureOpenAI
 
 try:
     import audioop
@@ -64,6 +65,18 @@ SUPABASE_URL = os.getenv("CORE_SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("CORE_SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 TENANT_ID = os.getenv("TENANT_ID", "").strip()
+
+# --- CUSTOM PIPELINE (Deepgram + GPT-4.1 + ElevenLabs) ---
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM").strip()
+PIPELINE_VERSION = os.getenv("PIPELINE_VERSION", "azure").strip()  # "azure" alebo "custom"
+
+DEEPGRAM_KEYTERMS = [
+    "Margherita", "Hawaii", "Salami", "Quattro%20Formaggi", "Bresaola",
+    "Prosciutto", "Panchetta", "Gorgonzola", "Pepperoni", "Carbonara",
+    "Ventricina", "Mortadella", "Pistacio", "Cola", "Kofola", "pizza", "pizzu",
+]
 
 # --- AZURE VOICE LIVE KONFIG ---
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "").strip()
@@ -334,11 +347,23 @@ def health_config():
 @app.api_route("/twilio/voice", methods=["GET", "POST"])
 async def twilio_voice_webhook(request: Request):
     """
-    Twilio voice webhook — ak sú Azure kľúče k dispozícii, spustí Media Stream
-    na náš /ws/voice WebSocket. Inak vráti fallback správu.
+    Twilio voice webhook — vyberá pipeline podľa PIPELINE_VERSION env premennej.
+    'azure'  → /ws/voice  (Azure Voice Live)
+    'custom' → /ws/voice-v2 (Deepgram + GPT-4.1 + ElevenLabs)
     """
-    if AZURE_SPEECH_KEY and AZURE_OPENAI_KEY:
-        host = request.headers.get("host", "")
+    host = request.headers.get("host", "")
+
+    if PIPELINE_VERSION == "custom" and DEEPGRAM_API_KEY and AZURE_OPENAI_KEY and ELEVENLABS_API_KEY:
+        ws_endpoint = f"wss://{host}/ws/voice-v2"
+        twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{ws_endpoint}">
+            <Parameter name="phone_number" value="{{{{From}}}}" />
+        </Stream>
+    </Connect>
+</Response>'''
+    elif AZURE_SPEECH_KEY and AZURE_OPENAI_KEY:
         twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
@@ -729,6 +754,382 @@ async def ws_voice(websocket: WebSocket):
             except Exception:
                 pass
         print("[ws/voice] spojenie ukončené")
+
+
+# ---------------------------------------------------------------------------
+# /ws/voice-v2: Custom pipeline — Deepgram STT + GPT-4.1 (Azure) + ElevenLabs TTS
+# ---------------------------------------------------------------------------
+
+# GPT-4.1 tools vo formáte openai SDK (type=function, function={name, description, parameters})
+PIZZA_TOOLS_OPENAI = [
+    {
+        "type": "function",
+        "function": {
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": t["parameters"],
+        },
+    }
+    for t in PIZZA_TOOLS
+]
+
+
+def _build_deepgram_url() -> str:
+    keyterms_qs = "&".join(f"keyterm={k}" for k in DEEPGRAM_KEYTERMS)
+    return (
+        f"wss://api.deepgram.com/v1/listen"
+        f"?model=nova-3"
+        f"&language=sk"
+        f"&encoding=mulaw"
+        f"&sample_rate=8000"
+        f"&punctuate=true"
+        f"&interim_results=false"
+        f"&endpointing=300"
+        f"&utterance_end_ms=1500"
+        f"&{keyterms_qs}"
+    )
+
+
+def _build_elevenlabs_url() -> str:
+    return (
+        f"wss://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream-input"
+        f"?model_id=eleven_multilingual_v2"
+        f"&output_format=ulaw_8000"
+    )
+
+
+async def _gpt_stream_and_tts(
+    messages: list,
+    el_ws,
+    twilio_ws: WebSocket,
+    stream_sid: str,
+    phone_number: str,
+    transcript_lines: list,
+) -> list:
+    """
+    Zavolá GPT-4.1 (Azure) streaming, posielá text chunky do ElevenLabs,
+    spracuje tool cally. Vráti aktualizovaný messages list.
+    """
+    azure_client = AzureOpenAI(
+        api_key=AZURE_OPENAI_KEY,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version="2025-01-01-preview",
+    )
+
+    # Iteratívna slučka pre tool cally
+    while True:
+        stream = azure_client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=messages,
+            tools=PIZZA_TOOLS_OPENAI,
+            tool_choice="auto",
+            stream=True,
+        )
+
+        # Akumulátory pre streamed odpoveď
+        assistant_text_chunks: list[str] = []
+        tool_calls_acc: dict = {}   # index -> {id, name, args}
+        chunk_buffer = ""           # buffer pre ElevenLabs (flush po 2+ slovách)
+
+        for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta is None:
+                continue
+
+            # Textový obsah → buffer → ElevenLabs
+            if delta.content:
+                text = delta.content
+                assistant_text_chunks.append(text)
+                chunk_buffer += text
+
+                # Flush keď máme aspoň 2 slová alebo chunk je dlhší ako 30 znakov
+                words = chunk_buffer.split()
+                if len(words) >= 2 or len(chunk_buffer) >= 30:
+                    await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
+                    chunk_buffer = ""
+
+            # Tool call accumulation
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {"id": "", "name": "", "args": ""}
+                    if tc.id:
+                        tool_calls_acc[idx]["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        tool_calls_acc[idx]["name"] = tc.function.name
+                    if tc.function and tc.function.arguments:
+                        tool_calls_acc[idx]["args"] += tc.function.arguments
+
+        # Flush zvyšok buffra
+        if chunk_buffer.strip():
+            await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
+            chunk_buffer = ""
+
+        # Signál konca vstupu ElevenLabs
+        await el_ws.send(json.dumps({"text": ""}))
+
+        assistant_content = "".join(assistant_text_chunks)
+        if assistant_content:
+            transcript_lines.append(f"Agent: {assistant_content}")
+            print(f"[v2/transcript] Agent: {assistant_content}")
+
+        # Žiadne tool cally — koniec
+        if not tool_calls_acc:
+            if assistant_content:
+                messages.append({"role": "assistant", "content": assistant_content})
+            return messages
+
+        # Spracuj tool cally
+        tool_call_items = []
+        for idx in sorted(tool_calls_acc.keys()):
+            tc = tool_calls_acc[idx]
+            tool_call_items.append({
+                "id": tc["id"],
+                "type": "function",
+                "function": {"name": tc["name"], "arguments": tc["args"]},
+            })
+
+        messages.append({
+            "role": "assistant",
+            "content": assistant_content or None,
+            "tool_calls": tool_call_items,
+        })
+
+        # Vykonaj každý tool a pridaj výsledok do messages
+        should_hangup = False
+        for tc_item in tool_call_items:
+            tool_name = tc_item["function"]["name"]
+            try:
+                tool_args = json.loads(tc_item["function"]["arguments"])
+            except Exception:
+                tool_args = {}
+
+            print(f"[v2/tool_call] name={tool_name} args={tool_args}")
+            result_str = await handle_tool_call(tool_name, tool_args, phone_number, transcript_lines)
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc_item["id"],
+                "content": result_str,
+            })
+
+            if tool_name == "ukonci_hovor":
+                should_hangup = True
+
+        if should_hangup:
+            # Nechaj GPT dohovoriť rozlúčku — jeden ďalší turn
+            stream2 = azure_client.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT,
+                messages=messages,
+                stream=True,
+            )
+            farewell_buf = ""
+            for chunk in stream2:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    farewell_buf += delta.content
+                    words = farewell_buf.split()
+                    if len(words) >= 2 or len(farewell_buf) >= 30:
+                        await el_ws.send(json.dumps({"text": farewell_buf, "flush": True}))
+                        farewell_buf = ""
+            if farewell_buf.strip():
+                await el_ws.send(json.dumps({"text": farewell_buf, "flush": True}))
+            await el_ws.send(json.dumps({"text": ""}))
+            await asyncio.sleep(3)
+            await twilio_ws.close()
+            return messages
+
+        # Pokračuj v slučke (GPT dostane výsledky toolov)
+
+
+@app.websocket("/ws/voice-v2")
+async def ws_voice_v2(websocket: WebSocket):
+    """
+    Custom pipeline: Twilio mulaw 8kHz → Deepgram STT → GPT-4.1 Azure → ElevenLabs TTS → Twilio.
+    Bez audio konverzie — Deepgram aj ElevenLabs pracujú s mulaw 8kHz natívne.
+    """
+    await websocket.accept()
+    print("[ws/voice-v2] Twilio pripojeny")
+
+    stream_sid: Optional[str] = None
+    phone_number: str = ""
+    transcript_lines: list = []
+
+    # Konverzačný stav pre GPT
+    menu_text = format_menu_from_db(TENANT_ID)
+    system_instructions = PIZZA_SYSTEM_PROMPT_BASE + "\n\n" + (menu_text if menu_text else PIZZA_MENU_FALLBACK)
+    messages: list = [{"role": "system", "content": system_instructions}]
+
+    deepgram_ws = None
+    el_ws = None
+
+    try:
+        # --- Otvoriť Deepgram WebSocket ---
+        dg_url = _build_deepgram_url()
+        print(f"[ws/voice-v2] Pripájam Deepgram: {dg_url.split('?')[0]}")
+        deepgram_ws = await websockets.connect(
+            dg_url,
+            additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            max_size=10 * 1024 * 1024,
+        )
+        print("[ws/voice-v2] Deepgram pripojený")
+
+        # --- Otvoriť ElevenLabs WebSocket ---
+        el_url = _build_elevenlabs_url()
+        print(f"[ws/voice-v2] Pripájam ElevenLabs: {el_url.split('?')[0]}")
+        el_ws = await websockets.connect(
+            el_url,
+            additional_headers={"xi-api-key": ELEVENLABS_API_KEY},
+            max_size=10 * 1024 * 1024,
+        )
+        print("[ws/voice-v2] ElevenLabs pripojený")
+
+        # Inicializácia ElevenLabs session
+        await el_ws.send(json.dumps({
+            "text": " ",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
+            "generation_config": {"chunk_length_schedule": [50, 100, 150, 200]},
+        }))
+
+        async def twilio_to_deepgram():
+            """Číta audio z Twilia a posiela priamo do Deepgram (mulaw 8kHz, bez konverzie)."""
+            nonlocal stream_sid, phone_number
+            while True:
+                try:
+                    raw = await websocket.receive_text()
+                except WebSocketDisconnect:
+                    print("[ws/voice-v2] Twilio odpojil")
+                    # Pošli Deepgramu keepalive close
+                    try:
+                        await deepgram_ws.send(json.dumps({"type": "CloseStream"}))
+                    except Exception:
+                        pass
+                    return
+                msg = json.loads(raw)
+                event = msg.get("event")
+
+                if event == "start":
+                    stream_sid = msg["start"].get("streamSid", "")
+                    phone_number = (
+                        msg["start"]
+                        .get("customParameters", {})
+                        .get("phone_number", "")
+                        or msg["start"].get("from", "")
+                    )
+                    print(f"[ws/voice-v2] stream started sid={stream_sid} phone={phone_number}")
+
+                    # Pozdravný turn — agent začína hovor
+                    asyncio.ensure_future(
+                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines)
+                    )
+
+                elif event == "media":
+                    mulaw_b64 = msg["media"]["payload"]
+                    mulaw_bytes = base64.b64decode(mulaw_b64)
+                    # Posielaj priamo do Deepgram — žiadna konverzia
+                    try:
+                        await deepgram_ws.send(mulaw_bytes)
+                    except Exception as e:
+                        print(f"[ws/voice-v2] Deepgram send error: {e}")
+                        return
+
+                elif event == "stop":
+                    print("[ws/voice-v2] Twilio stream stop")
+                    try:
+                        await deepgram_ws.send(json.dumps({"type": "CloseStream"}))
+                    except Exception:
+                        pass
+                    return
+
+        async def deepgram_to_gpt():
+            """Číta transkript z Deepgram a spúšťa GPT+TTS pipeline."""
+            nonlocal messages
+            while True:
+                try:
+                    raw = await deepgram_ws.recv()
+                except Exception as e:
+                    print(f"[ws/voice-v2] Deepgram WS ukončil: {e}")
+                    return
+
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+
+                if msg.get("type") != "Results":
+                    continue
+
+                is_final = msg.get("is_final", False)
+                if not is_final:
+                    continue
+
+                try:
+                    transcript = msg["channel"]["alternatives"][0]["transcript"].strip()
+                except (KeyError, IndexError):
+                    continue
+
+                if not transcript or len(transcript.split()) < 2:
+                    if transcript:
+                        print(f"[v2/transcript/skip] Zákazník (príliš krátke): {transcript}")
+                    continue
+
+                print(f"[v2/transcript] Zákazník: {transcript}")
+                transcript_lines.append(f"Zákazník: {transcript}")
+                messages.append({"role": "user", "content": transcript})
+
+                # Spusti GPT+TTS — nečakáme (fire-and-forget), aby sme mohli ďalej čítať Deepgram
+                asyncio.ensure_future(
+                    _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines)
+                )
+
+        async def elevenlabs_to_twilio():
+            """Číta audio z ElevenLabs a posiela priamo do Twilia (ulaw 8kHz, bez konverzie)."""
+            while True:
+                try:
+                    raw = await el_ws.recv()
+                except Exception as e:
+                    print(f"[ws/voice-v2] ElevenLabs WS ukončil: {e}")
+                    return
+
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    # Binárne dáta — priamo audio (ElevenLabs niekedy posiela raw bytes)
+                    if isinstance(raw, bytes) and stream_sid:
+                        audio_b64 = base64.b64encode(raw).decode()
+                        await websocket.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": audio_b64},
+                        }))
+                    continue
+
+                if msg.get("audio") and stream_sid:
+                    await websocket.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {"payload": msg["audio"]},
+                    }))
+                elif msg.get("isFinal"):
+                    print("[ws/voice-v2] ElevenLabs: koniec audio streamu")
+
+        await asyncio.gather(
+            twilio_to_deepgram(),
+            deepgram_to_gpt(),
+            elevenlabs_to_twilio(),
+        )
+
+    except Exception as e:
+        print(f"[ws/voice-v2] chyba: {e}")
+    finally:
+        for ws in [deepgram_ws, el_ws]:
+            if ws:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+        print("[ws/voice-v2] spojenie ukončené")
 
 
 if __name__ == "__main__":
