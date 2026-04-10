@@ -4,11 +4,8 @@ import asyncio
 import unicodedata
 import json
 import base64
-import struct
-from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Optional
 from rapidfuzz import fuzz, process
-import httpx
 import websockets
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,8 +64,6 @@ SUPABASE_URL = os.getenv("CORE_SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("CORE_SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 TENANT_ID = os.getenv("TENANT_ID", "").strip()
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
-FINALIZE_DELAY_SECONDS = float(os.getenv("FINALIZE_DELAY_SECONDS", "2.0"))
 
 # --- AZURE VOICE LIVE KONFIG ---
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "").strip()
@@ -80,19 +75,42 @@ AZURE_AI_SERVICES_ENDPOINT = os.getenv("AZURE_AI_SERVICES_ENDPOINT", "").strip()
 _ws_base = AZURE_AI_SERVICES_ENDPOINT.rstrip("/").replace("https://", "wss://") if AZURE_AI_SERVICES_ENDPOINT else f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com"
 AZURE_VOICE_LIVE_WS_URL = f"{_ws_base}/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key={AZURE_SPEECH_KEY}"
 
-PIZZA_SYSTEM_PROMPT = """Hovor prirodzene, priateľsky a svižne. Nepoužívaj dlhé vety.
+PIZZA_SYSTEM_PROMPT_BASE = """Hovor prirodzene, priateľsky a svižne. Nepoužívaj dlhé vety.
 
 Si priateľský hlasový asistent Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky pizze.
 Tvoj postup:
 1. Privítaj zákazníka
 2. Spýtaj sa čo si želá objednať (ponúkni aj nápoje/dezerty ako upsell)
 3. Spýtaj sa na adresu doručenia
-4. Zopakuj objednávku a potvrd ju
-5. Po potvrdení zavolaj funkciu uloz_objednavku
+4. Over adresu cez funkciu over_adresu. Ak adresa nie je v zóne doručenia, povedz to zákazníkovi.
+5. Vypočítaj celkovú cenu (suma položiek + dovoz: zadarmo nad 15€, inak 2€)
+6. Zopakuj objednávku s celkovou cenou a potvrd ju
+7. Po potvrdení zavolaj funkciu uloz_objednavku
 
-Buď stručný, hovor krátke vety (max 2-3 vety naraz). Ceny: Margherita 6.90€, Šunková 7.50€, Diavola 8.20€, Quattro Formaggi 8.90€. Dovoz zadarmo nad 15€, inak 2€."""
+Buď stručný, hovor krátke vety (max 2-3 vety naraz). Dovoz zadarmo nad 15€, inak 2€."""
+
+PIZZA_MENU_FALLBACK = """
+MENU (fallback):
+| Pizza | Cena |
+|-------|------|
+| Margherita | 6.90€ |
+| Šunková | 7.50€ |
+| Diavola | 8.20€ |
+| Quattro Formaggi | 8.90€ |"""
 
 PIZZA_TOOLS = [
+    {
+        "type": "function",
+        "name": "over_adresu",
+        "description": "Overí či adresa je v zóne doručenia. Volaj pred uložením objednávky.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "Adresa doručenia na overenie"},
+            },
+            "required": ["address"],
+        },
+    },
     {
         "type": "function",
         "name": "uloz_objednavku",
@@ -104,10 +122,11 @@ PIZZA_TOOLS = [
                 "upsell": {"type": "string", "description": "Doplnkový produkt alebo 'ziadny'"},
                 "address": {"type": "string", "description": "Adresa doručenia"},
                 "phone_number": {"type": "string", "description": "Telefónne číslo zákazníka"},
+                "total_price": {"type": "number", "description": "Celková cena vrátane dovozu"},
             },
-            "required": ["pizza_type", "upsell", "address", "phone_number"],
+            "required": ["pizza_type", "upsell", "address", "phone_number", "total_price"],
         },
-    }
+    },
 ]
 
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -121,8 +140,6 @@ if not TENANT_ID:
     print("VAROVANIE: TENANT_ID nie je nastavene")
 
 print("--- STARTUP KONFIG ---")
-print(f"ELEVENLABS_API_KEY nastavene: {'ano' if bool(ELEVENLABS_API_KEY) else 'nie'}")
-print(f"FINALIZE_DELAY_SECONDS: {FINALIZE_DELAY_SECONDS}")
 print(f"PORT: {os.getenv('PORT', 'nenastaveny')}")
 print(f"CORE_SUPABASE_URL nastavene: {'ano' if bool(SUPABASE_URL) else 'nie'}")
 print(f"CORE_SUPABASE_SERVICE_ROLE_KEY nastavene: {'ano' if bool(SUPABASE_KEY) else 'nie'}")
@@ -147,101 +164,8 @@ except Exception as e:
     supabase = None
 
 
-# ---------------------------------------------------------------------------
-# SESSION STATE — in-memory, keyed by ElevenLabs conversation_id
-# ---------------------------------------------------------------------------
-
-@dataclass
-class CallSession:
-    conversation_id: str
-    order_finalized: bool = False       # manage_order úspešne vykonaný (DB insert)
-    call_ending: bool = False           # end_call bol spustený (hovor sa ukončuje)
-    finalize_task: Optional[asyncio.Task] = None  # pending auto-hangup timer
-    created_at: float = field(default_factory=time.monotonic)
-
-
-_SESSIONS: Dict[str, CallSession] = {}
-_SESSION_TTL = 3600  # 1 hodina — po nej sa session vyčistí (lazy)
-
-
-def _cleanup_old_sessions() -> None:
-    """Vyčistí sessions staršie ako SESSION_TTL. Volá sa lazy pri každom prístupe."""
-    now = time.monotonic()
-    stale = [cid for cid, s in _SESSIONS.items() if now - s.created_at > _SESSION_TTL]
-    for cid in stale:
-        _SESSIONS.pop(cid, None)
-
-
-def get_or_create_session(conversation_id: str) -> CallSession:
-    _cleanup_old_sessions()
-    if conversation_id not in _SESSIONS:
-        _SESSIONS[conversation_id] = CallSession(conversation_id=conversation_id)
-    return _SESSIONS[conversation_id]
-
-
-def extract_conversation_id(request: Request) -> Optional[str]:
-    """Extrahuje conversation_id z ElevenLabs HTTP hlavičky alebo query parametra."""
-    # ElevenLabs posiela conversation_id v hlavičke
-    cid = request.headers.get("ElevenLabs-Conversation-Id") or request.headers.get("elevenlabs-conversation-id")
-    if cid:
-        return cid.strip()
-    return None
-
-
-def cancel_post_summary_finalize(session: CallSession) -> None:
-    """Zruší pending auto-hangup timer ak existuje."""
-    if session.finalize_task and not session.finalize_task.done():
-        session.finalize_task.cancel()
-        print(f"[session:{session.conversation_id}] finalize timer zruseny")
-    session.finalize_task = None
-
-
-async def elevenlabs_end_call_api(conversation_id: str) -> None:
-    """Zavolá ElevenLabs REST API na ukončenie konverzácie."""
-    if not ELEVENLABS_API_KEY:
-        print(f"[session:{conversation_id}] ELEVENLABS_API_KEY nie je nastaveny — auto-hangup preskoceny")
-        return
-    url = f"https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.delete(url, headers={"xi-api-key": ELEVENLABS_API_KEY})
-        print(f"[session:{conversation_id}] ElevenLabs end_call API -> {resp.status_code}")
-    except Exception as e:
-        print(f"[session:{conversation_id}] ElevenLabs end_call API chyba: {e}")
-
-
-def schedule_auto_end_call(session: CallSession, delay: float = FINALIZE_DELAY_SECONDS) -> None:
-    """Naplánuje asyncio task ktorý po 'delay' sekundách zavolá ElevenLabs API na hangup."""
-    cancel_post_summary_finalize(session)  # zruší prípadný predchádzajúci timer
-
-    async def _auto_hangup():
-        await asyncio.sleep(delay)
-        session_now = _SESSIONS.get(session.conversation_id)
-        if session_now and not session_now.call_ending:
-            session_now.call_ending = True
-            print(f"[session:{session.conversation_id}] auto-hangup timer dobehol — volam ElevenLabs API")
-            await elevenlabs_end_call_api(session.conversation_id)
-
-    session.finalize_task = asyncio.create_task(_auto_hangup())
-    print(f"[session:{session.conversation_id}] auto-hangup timer nastaveny na {delay}s")
-
-
-# ---------------------------------------------------------------------------
-
-
 class SearchStreetRequest(BaseModel):
     query: str
-
-
-class ManageOrder(BaseModel):
-    pizza_type: str
-    total_price: float
-    delivery_address: str
-    customer_phone: Optional[str] = None
-    customer_name: Optional[str] = None
-    upsell_item: Optional[str] = None
-    upsell_accepted: bool = False
-    transcript: Optional[str] = None
 
 
 ALLERGEN_MAP = {
@@ -424,7 +348,9 @@ async def twilio_voice_webhook(request: Request):
         twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="wss://{host}/ws/voice" />
+        <Stream url="wss://{host}/ws/voice">
+            <Parameter name="phone_number" value="{{{{From}}}}" />
+        </Stream>
     </Connect>
 </Response>'''
     else:
@@ -462,32 +388,9 @@ async def twilio_status_webhook(request: Request):
     return {"status": "ok"}
 
 
-@app.post("/api/prompt-config")
-async def prompt_config():
-    """
-    ElevenLabs Server URL endpoint — volá sa pred každým hovorom.
-    Vracia dynamic_variables s aktuálnym menu z DB.
-    """
-    menu_text = format_menu_from_db(TENANT_ID)
-    return {
-        "dynamic_variables": {
-            "menu": menu_text if menu_text else "Menu nie je momentálne dostupné.",
-        }
-    }
-
-
 @app.post("/api/search-street")
-async def search_street(request: Request, body: SearchStreetRequest):
-    """
-    Fuzzy vyhľadávanie ulice podľa časti názvu (STT výstup z ElevenLabs).
-    Cachuje ulice z DB na 5 minút. Vracia max 2 zhody so skóre ≥ 55.
-    Ak prebieha finalizačný timer (user koriguje adresu), zruší ho.
-    """
-    # Ak user hovorí o adrese, zruší prípadný pending finalize timer
-    cid = extract_conversation_id(request)
-    if cid and cid in _SESSIONS:
-        cancel_post_summary_finalize(_SESSIONS[cid])
-
+async def search_street(body: SearchStreetRequest):
+    """Fuzzy vyhľadávanie ulice — cachuje ulice z DB na 5 minút, vracia max 2 zhody so skóre ≥ 55."""
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
 
@@ -527,99 +430,6 @@ async def search_street(request: Request, body: SearchStreetRequest):
     }
 
 
-@app.post("/api/vytvor-objednavku")
-async def vytvor_objednavku(request: Request):
-    """
-    Endpoint pre ElevenLabs agenta (manage_order tool) na ulozenie objednavky do DB.
-    Idempotentný: druhý call s rovnakým conversation_id nevytvorí duplicitný záznam.
-    Po úspešnom uložení spustí auto-hangup timer (FINALIZE_DELAY_SECONDS).
-    """
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
-
-    try:
-        body = await request.json()
-        print(f"[vytvor-objednavku] raw body: {body}")
-        order = ManageOrder(**body)
-    except Exception as e:
-        print(f"[vytvor-objednavku] validacna chyba: {e}")
-        raise HTTPException(status_code=422, detail=str(e))
-
-    # --- IDEMPOTENCIA: ak sme túto objednávku už uložili, vrátime cached success ---
-    cid = extract_conversation_id(request)
-    if cid:
-        session = get_or_create_session(cid)
-        if session.order_finalized:
-            print(f"[vytvor-objednavku] session:{cid} uz finalizovana — preskakujem DB insert")
-            return {"status": "success", "message": "Objednavka uspesne zapisana."}
-        # Nastavíme flag PRED asyncom, aby súbežný request videl finalized=True
-        session.order_finalized = True
-    else:
-        session = None
-        print("[vytvor-objednavku] conversation_id chyba — session tracking preskoceny")
-
-    try:
-        matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
-
-        order_data = {
-            "tenant_id": TENANT_ID,
-            "customer_phone": order.customer_phone or "",
-            "phone_raw": order.customer_phone or "",
-            "customer_name": order.customer_name or "Zákazník",
-            "pizza_type": order.pizza_type,
-            "total_price": order.total_price,
-            "delivery_address": matched_address,
-            "address_raw": order.delivery_address,
-            "address_confidence": confidence,
-            "upsell_offered": order.upsell_item is not None,
-            "upsell_item": order.upsell_item,
-            "upsell_accepted": order.upsell_accepted,
-            "notes": order.transcript,
-            "status": "NEW",
-        }
-
-        supabase.table("pizza_orders").insert(order_data).execute()
-
-        # --- AUTO-HANGUP: po úspešnom uložení naplánuj ukončenie hovoru ---
-        if session and cid:
-            schedule_auto_end_call(session, delay=FINALIZE_DELAY_SECONDS)
-
-        return {
-            "status": "success",
-            "message": "Objednavka uspesne zapisana.",
-        }
-
-    except Exception as e:
-        # Ak DB zápis zlyhal, resetujeme flag aby mohol byť retry
-        if session:
-            session.order_finalized = False
-        error_msg = str(e)
-        print(f"DEBUG CHYBA: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"Chyba Supabase: {error_msg}")
-
-
-@app.post("/api/end-call")
-async def end_call(request: Request):
-    """
-    ElevenLabs agent tool — zavolá sa keď agent chce ukončiť hovor podľa promptu.
-    Idempotentný: druhý call je no-op (guard cez call_ending flag).
-    Zruší prípadný pending auto-hangup timer (aby nedošlo k dvojitému volaniu API).
-    """
-    cid = extract_conversation_id(request)
-    if cid:
-        session = get_or_create_session(cid)
-        if session.call_ending:
-            print(f"[end-call] session:{cid} uz ukonculavana — preskakujem")
-            return {"status": "ok"}
-        session.call_ending = True
-        cancel_post_summary_finalize(session)
-        print(f"[end-call] session:{cid} hovor sa ukonculava (agent-triggered)")
-    else:
-        print("[end-call] conversation_id chyba — pokracujem bez session")
-
-    return {"status": "ok"}
-
-
 # ---------------------------------------------------------------------------
 # AUDIO KONVERZIA: mulaw 8kHz (Twilio) ↔ PCM 16kHz (Azure Voice Live)
 # ---------------------------------------------------------------------------
@@ -644,8 +454,10 @@ def pcm16k_to_mulaw8k(pcm16k: bytes) -> bytes:
 
 def build_azure_session_config(phone_number: str = "") -> dict:
     """Zostaví konfiguračnú správu pre Azure Voice Live API.
-    Kľúče NIE sú tu — idú len v WS headers pri pripojení.
+    Načíta menu z DB pri každom hovore. Kľúče idú len v WS headers.
     """
+    menu_text = format_menu_from_db(TENANT_ID)
+    instructions = PIZZA_SYSTEM_PROMPT_BASE + "\n\n" + (menu_text if menu_text else PIZZA_MENU_FALLBACK)
     return {
         "type": "session.update",
         "session": {
@@ -659,19 +471,25 @@ def build_azure_session_config(phone_number: str = "") -> dict:
             "input_audio_noise_reduction": {
                 "type": "azure_deep_noise_suppression"
             },
-            # Aktívny hlas: natívny slovenský
+            # Aktívny hlas: natívny slovenský (mužský)
             "voice": {
                 "name": "sk-SK-LukasNeural",
                 "type": "azure-standard",
                 "rate": "1.1",
             },
+            # Záložný hlas: natívny slovenský (ženský)
+            # "voice": {
+            #     "name": "sk-SK-ViktoriaNeural",
+            #     "type": "azure-standard",
+            #     "rate": "1.1",
+            # },
             # Záložný hlas: multilingual HD (americký prízvuk)
             # "voice": {
             #     "name": "en-US-Andrew:DragonHDLatestNeural",
             #     "type": "azure-standard",
             #     "temperature": 0.8,
             # },
-            "instructions": PIZZA_SYSTEM_PROMPT,
+            "instructions": instructions,
             "tools": PIZZA_TOOLS,
             "tool_choice": "auto",
         },
@@ -679,7 +497,17 @@ def build_azure_session_config(phone_number: str = "") -> dict:
 
 
 async def handle_tool_call(tool_name: str, tool_args: dict, phone_number: str) -> str:
-    """Vykoná tool call od Azure agenta — insertne objednávku priamo cez Supabase."""
+    """Vykoná tool call od Azure agenta."""
+    if tool_name == "over_adresu":
+        raw_address = tool_args.get("address", "")
+        matched_address, confidence = match_street(raw_address, TENANT_ID)
+        if confidence > 0:
+            print(f"[tool] over_adresu OK: '{raw_address}' -> '{matched_address}'")
+            return json.dumps({"found": True, "best_match": matched_address})
+        else:
+            print(f"[tool] over_adresu NOT FOUND: '{raw_address}'")
+            return json.dumps({"found": False, "message": "Adresa nie je v zóne doručenia."})
+
     if tool_name == "uloz_objednavku":
         if not tool_args.get("phone_number"):
             tool_args["phone_number"] = phone_number
@@ -694,7 +522,7 @@ async def handle_tool_call(tool_name: str, tool_args: dict, phone_number: str) -
                 "phone_raw": tool_args.get("phone_number", ""),
                 "customer_name": "Zákazník",
                 "pizza_type": tool_args.get("pizza_type", ""),
-                "total_price": 0,
+                "total_price": float(tool_args.get("total_price", 0)),
                 "delivery_address": matched_address,
                 "address_raw": raw_address,
                 "address_confidence": confidence,
@@ -710,6 +538,7 @@ async def handle_tool_call(tool_name: str, tool_args: dict, phone_number: str) -
         except Exception as e:
             print(f"[tool] uloz_objednavku chyba: {e}")
             return json.dumps({"status": "error", "message": str(e)})
+
     return json.dumps({"status": "error", "message": f"Neznámy tool: {tool_name}"})
 
 
