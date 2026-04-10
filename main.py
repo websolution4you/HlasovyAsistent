@@ -584,13 +584,10 @@ async def ws_voice(websocket: WebSocket):
         print(f"[ws/voice] Posielam session.update: {json.dumps(session_cfg)}")
         await azure_ws.send(json.dumps(session_cfg))
 
-        # Spusti úvodné privítanie — agent hovorí prvý bez čakania na zákazníka
-        await azure_ws.send(json.dumps({"type": "response.create"}))
-        print("[ws/voice] Odoslany response.create — agent zacina sam")
-
         async def twilio_to_azure():
             """Číta správy od Twilia, konvertuje audio a posiela do Azure."""
             nonlocal stream_sid, phone_number
+            greeting_sent = False
             while True:
                 try:
                     raw = await websocket.receive_text()
@@ -609,6 +606,11 @@ async def ws_voice(websocket: WebSocket):
                         or msg["start"].get("from", "")
                     )
                     print(f"[ws/voice] stream started sid={stream_sid} phone={phone_number}")
+                    # Pošli pozdrav až keď je stream_sid nastavený — audio bude mať kam ísť
+                    if not greeting_sent:
+                        await azure_ws.send(json.dumps({"type": "response.create"}))
+                        print("[ws/voice] response.create odoslany po start evente")
+                        greeting_sent = True
 
                 elif event == "media":
                     mulaw_b64 = msg["media"]["payload"]
