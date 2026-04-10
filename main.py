@@ -94,7 +94,7 @@ AZURE_VOICE_LIVE_WS_URL = f"{_ws_base}/voice-live/realtime?api-version=2025-10-0
 
 # --- GEMINI LIVE API KONFIG ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
-GEMINI_MODEL = "gemini-2.0-flash-exp"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp").strip()
 
 _prompt_path = os.path.join(os.path.dirname(__file__), "prompt.txt")
 PIZZA_SYSTEM_PROMPT_BASE = open(_prompt_path, encoding="utf-8").read().strip()
@@ -854,7 +854,7 @@ async def _google_tts(text: str) -> bytes:
     return base64.b64decode(resp.json().get("audioContent", ""))
 
 
-async def safe_send_twilio(twilio_ws: WebSocket, payload: dict, stream_sid: str, connection_closed: asyncio.Event) -> bool:
+async def safe_send_twilio(twilio_ws: WebSocket, payload: dict, connection_closed: asyncio.Event) -> bool:
     """Bezpečne pošle správu do Twilio, chytí chyby pri zatvorenom spojení."""
     if connection_closed.is_set():
         return False
@@ -866,8 +866,8 @@ async def safe_send_twilio(twilio_ws: WebSocket, payload: dict, stream_sid: str,
         return False
 
 
-async def _tts_to_twilio(text: str, twilio_ws: WebSocket, stream_sid: str, connection_closed: asyncio.Event, sent_sentences: set) -> None:
-    """Rozdelí text na vety, vygeneruje audio, pošle do Twilia. Zabráni duplicitám."""
+async def _tts_to_twilio(text: str, twilio_ws: WebSocket, stream_sid: str, connection_closed: asyncio.Event) -> None:
+    """Rozdelí text na vety, vygeneruje audio sekvenčne, pošle do Twilia."""
     if not text.strip() or not stream_sid or connection_closed.is_set():
         return
     
@@ -879,22 +879,21 @@ async def _tts_to_twilio(text: str, twilio_ws: WebSocket, stream_sid: str, conne
     if not sentences:
         sentences = [text.strip()]
     
-    # Filtruj duplicity
-    new_sentences = []
+    # Lokálna deduplikácia v rámci tohto textu
+    local_sentences = set()
+    unique_sentences = []
     for sentence in sentences:
-        if sentence not in sent_sentences:
-            sent_sentences.add(sentence)
-            new_sentences.append(sentence)
-        else:
-            print(f"[tts] skipped duplicate sentence: {sentence[:50]}...")
+        if sentence not in local_sentences:
+            local_sentences.add(sentence)
+            unique_sentences.append(sentence)
     
-    if not new_sentences:
+    if not unique_sentences:
         return
     
-    print(f"[tts] sending {len(new_sentences)} sentences")
+    print(f"[tts] sending {len(unique_sentences)} sentences")
     
-    # Generuj audio pre každú vetu
-    for sentence in new_sentences:
+    # Generuj audio pre každú vetu sekvenčne
+    for sentence in unique_sentences:
         if connection_closed.is_set():
             print("[tts] aborted because connection closed")
             return
@@ -910,7 +909,6 @@ async def _tts_to_twilio(text: str, twilio_ws: WebSocket, stream_sid: str, conne
                         "streamSid": stream_sid,
                         "media": {"payload": base64.b64encode(audio_bytes).decode()},
                     },
-                    stream_sid,
                     connection_closed
                 )
                 if not success:
