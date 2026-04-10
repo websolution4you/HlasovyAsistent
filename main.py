@@ -464,15 +464,15 @@ def build_azure_session_config(phone_number: str = "") -> dict:
             "input_audio_noise_reduction": {
                 "type": "azure_deep_noise_suppression"
             },
-            # Aktívny hlas: český (na testovanie — prirodzenejší TTS)
+            # Aktívny hlas: natívny slovenský (ženský)
             "voice": {
-                "name": "cs-CZ-VlastaNeural",
+                "name": "sk-SK-ViktoriaNeural",
                 "type": "azure-standard",
                 "rate": "1.1",
             },
-            # Záložný hlas: natívny slovenský (ženský)
+            # Záložný hlas: český (test)
             # "voice": {
-            #     "name": "sk-SK-ViktoriaNeural",
+            #     "name": "cs-CZ-VlastaNeural",
             #     "type": "azure-standard",
             #     "rate": "1.1",
             # },
