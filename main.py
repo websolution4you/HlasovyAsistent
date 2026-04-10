@@ -831,7 +831,6 @@ async def _gpt_stream_and_tts(
     phone_number: str,
     transcript_lines: list,
     gpt_lock: asyncio.Lock,
-    el_done_event: asyncio.Event = None,
 ) -> list:
     """
     Zavolá GPT-4.1 (Azure) streaming, posielá text chunky do ElevenLabs,
@@ -950,24 +949,16 @@ async def _gpt_stream_and_tts(
                     should_hangup = True
 
             if should_hangup:
-                # Rozlúčkový turn — len ak GPT nepovedal rozlúčku už v assistant_content
-                if not assistant_content:
-                    stream2 = azure_client.chat.completions.create(
-                        model=AZURE_OPENAI_DEPLOYMENT,
-                        messages=messages,
-                        stream=True,
-                    )
-                    await _stream_to_elevenlabs(stream2)
-                # Signalizuj ElevenLabs koniec textu
+                # Rozlúčkový turn
+                stream2 = azure_client.chat.completions.create(
+                    model=AZURE_OPENAI_DEPLOYMENT,
+                    messages=messages,
+                    stream=True,
+                )
+                await _stream_to_elevenlabs(stream2)
+                # Teraz zatvor ElevenLabs stream — koniec hovoru
                 await el_ws.send(json.dumps({"text": ""}))
-                # Počkaj kým ElevenLabs odošle všetko audio (isFinal event), max 8s
-                if el_done_event is not None:
-                    try:
-                        await asyncio.wait_for(el_done_event.wait(), timeout=8.0)
-                    except asyncio.TimeoutError:
-                        print("[ws/voice-v2] el_done timeout — zatváram bez isFinal")
-                else:
-                    await asyncio.sleep(6)
+                await asyncio.sleep(3)
                 await twilio_ws.close()
                 return messages
 
@@ -987,7 +978,6 @@ async def ws_voice_v2(websocket: WebSocket):
     phone_number: str = ""
     transcript_lines: list = []
     gpt_lock = asyncio.Lock()  # len jeden GPT+TTS turn naraz
-    el_done_event = asyncio.Event()  # ElevenLabs signalizuje isFinal
 
     # Konverzačný stav pre GPT
     menu_text = format_menu_from_db(TENANT_ID)
@@ -1062,12 +1052,10 @@ async def ws_voice_v2(websocket: WebSocket):
                     print(f"[ws/voice-v2] stream started sid={stream_sid} phone={phone_number}")
                     print(f"[ws/voice-v2] start payload keys: {list(start_data.keys())}")
 
-                    # Okamžitý pozdrav priamo cez ElevenLabs — bez čakania na GPT (eliminuje 3s startup delay)
-                    GREETING = "Dobrý deň, Pizza Sicilia, ako vám môžem pomôcť?"
-                    await el_ws.send(json.dumps({"text": GREETING, "flush": True}))
-                    messages.append({"role": "assistant", "content": GREETING})
-                    transcript_lines.append(f"Agent: {GREETING}")
-                    print(f"[ws/voice-v2] okamžitý pozdrav odoslaný do ElevenLabs")
+                    # Pozdravný turn — agent začína hovor
+                    asyncio.ensure_future(
+                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
+                    )
 
                 elif event == "media":
                     mulaw_b64 = msg["media"]["payload"]
@@ -1138,9 +1126,8 @@ async def ws_voice_v2(websocket: WebSocket):
                     transcript_lines.append(f"Zákazník: {full_transcript}")
                     messages.append({"role": "user", "content": full_transcript})
 
-                    el_done_event.clear()
                     asyncio.ensure_future(
-                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines, gpt_lock, el_done_event)
+                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
                     )
 
         async def elevenlabs_to_twilio():
@@ -1173,7 +1160,6 @@ async def ws_voice_v2(websocket: WebSocket):
                     }))
                 elif msg.get("isFinal"):
                     print("[ws/voice-v2] ElevenLabs: koniec audio streamu")
-                    el_done_event.set()
 
         async def elevenlabs_keepalive():
             """Posiela prázdny text každých 10s aby ElevenLabs WS nezatvoril spojenie (timeout 20s)."""
