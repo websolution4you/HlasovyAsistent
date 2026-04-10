@@ -784,7 +784,7 @@ def _build_deepgram_url() -> str:
         f"&sample_rate=8000"
         f"&channels=1"
         f"&punctuate=true"
-        f"&interim_results=false"
+        f"&interim_results=true"
         f"&endpointing=300"
         f"&utterance_end_ms=1500"
         f"&{keywords_qs}"
@@ -1054,8 +1054,16 @@ async def ws_voice_v2(websocket: WebSocket):
                     return
 
         async def deepgram_to_gpt():
-            """Číta transkript z Deepgram a spúšťa GPT+TTS pipeline."""
+            """Číta transkript z Deepgram a spúšťa GPT+TTS pipeline.
+
+            interim_results=true → dostávame aj interim správy, reagujeme len na:
+              - is_final=true  (Deepgram uzavrel utterance cez endpointing)
+              - UtteranceEnd   (Deepgram uzavrel utterance cez utterance_end_ms)
+            Akumulujeme is_final časti do buffra, GPT spustíme až pri UtteranceEnd.
+            """
             nonlocal messages
+            utterance_buffer: list[str] = []
+
             while True:
                 try:
                     raw = await deepgram_ws.recv()
@@ -1068,31 +1076,37 @@ async def ws_voice_v2(websocket: WebSocket):
                 except Exception:
                     continue
 
-                if msg.get("type") != "Results":
-                    continue
+                msg_type = msg.get("type", "")
 
-                is_final = msg.get("is_final", False)
-                if not is_final:
-                    continue
-
-                try:
-                    transcript = msg["channel"]["alternatives"][0]["transcript"].strip()
-                except (KeyError, IndexError):
-                    continue
-
-                if not transcript or len(transcript.split()) < 2:
+                if msg_type == "Results":
+                    if not msg.get("is_final", False):
+                        continue  # ignoruj interim výsledky
+                    try:
+                        transcript = msg["channel"]["alternatives"][0]["transcript"].strip()
+                    except (KeyError, IndexError):
+                        continue
                     if transcript:
-                        print(f"[v2/transcript/skip] Zákazník (príliš krátke): {transcript}")
-                    continue
+                        print(f"[v2/transcript/partial] Zákazník: {transcript}")
+                        utterance_buffer.append(transcript)
 
-                print(f"[v2/transcript] Zákazník: {transcript}")
-                transcript_lines.append(f"Zákazník: {transcript}")
-                messages.append({"role": "user", "content": transcript})
+                elif msg_type == "UtteranceEnd":
+                    # Zákazník prestal hovoriť — spusti GPT so všetkým čo sme zachytili
+                    if not utterance_buffer:
+                        continue
+                    full_transcript = " ".join(utterance_buffer).strip()
+                    utterance_buffer.clear()
 
-                # Spusti GPT+TTS — nečakáme (fire-and-forget), aby sme mohli ďalej čítať Deepgram
-                asyncio.ensure_future(
-                    _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines)
-                )
+                    if len(full_transcript.split()) < 2:
+                        print(f"[v2/transcript/skip] Zákazník (príliš krátke): {full_transcript}")
+                        continue
+
+                    print(f"[v2/transcript] Zákazník: {full_transcript}")
+                    transcript_lines.append(f"Zákazník: {full_transcript}")
+                    messages.append({"role": "user", "content": full_transcript})
+
+                    asyncio.ensure_future(
+                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines)
+                    )
 
         async def elevenlabs_to_twilio():
             """Číta audio z ElevenLabs a posiela priamo do Twilia (ulaw 8kHz, bez konverzie)."""
