@@ -1063,7 +1063,7 @@ async def ws_voice_v2(websocket: WebSocket):
                     print(f"[ws/voice-v2] start payload keys: {list(start_data.keys())}")
 
                     # Okamžitý pozdrav priamo cez ElevenLabs — bez čakania na GPT (eliminuje 3s startup delay)
-                    GREETING = "Dobrý deň, Pizza Sicilia, ako vám môžem pomôcť?"
+                    GREETING = "Dobrý deň, Pizzeria Sicilia, ako vám môžem pomôcť?"
                     await el_ws.send(json.dumps({"text": GREETING, "flush": True}))
                     messages.append({"role": "assistant", "content": GREETING})
                     transcript_lines.append(f"Agent: {GREETING}")
