@@ -362,9 +362,7 @@ async def twilio_voice_webhook(request: Request):
         twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="{ws_endpoint}">
-            <Parameter name="phone_number" value="{{{{From}}}}" />
-        </Stream>
+        <Stream url="{ws_endpoint}" />
     </Connect>
 </Response>'''
     elif AZURE_SPEECH_KEY and AZURE_OPENAI_KEY:
@@ -1045,14 +1043,15 @@ async def ws_voice_v2(websocket: WebSocket):
                 event = msg.get("event")
 
                 if event == "start":
-                    stream_sid = msg["start"].get("streamSid", "")
+                    start_data = msg["start"]
+                    stream_sid = start_data.get("streamSid", "")
+                    # Twilio posiela číslo volajúceho v start.from (nie cez <Parameter> — ten nepodporuje substitúciu)
                     phone_number = (
-                        msg["start"]
-                        .get("customParameters", {})
-                        .get("phone_number", "")
-                        or msg["start"].get("from", "")
+                        start_data.get("from", "")
+                        or start_data.get("customParameters", {}).get("phone_number", "")
                     )
                     print(f"[ws/voice-v2] stream started sid={stream_sid} phone={phone_number}")
+                    print(f"[ws/voice-v2] start payload keys: {list(start_data.keys())}")
 
                     # Pozdravný turn — agent začína hovor
                     asyncio.ensure_future(
