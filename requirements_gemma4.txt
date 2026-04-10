@@ -1,0 +1,30 @@
+# FastAPI a základné závislosti
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+python-multipart
+websockets
+
+# Audio spracovanie
+audioop-lts
+
+# Databáza a utility
+supabase
+rapidfuzz
+httpx
+
+# Gemma 4 model - vLLM (preferované pre produkciu)
+# Poznámka: vLLM vyžaduje CUDA a GPU
+vllm>=0.6.0
+
+# Alternatíva: google-ai-edge SDK (ak vLLM nefunguje)
+# Odkomentuj ak chceš použiť Edge SDK namiesto vLLM:
+# google-ai-edge
+
+# Numpy pre audio spracovanie
+numpy
+
+# CUDA support (automaticky sa nainštaluje s vLLM)
+# torch>=2.1.0
+# Poznámka: vLLM si nainštaluje správnu verziu PyTorch s CUDA supportom
