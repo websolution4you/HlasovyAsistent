@@ -163,6 +163,10 @@ print(f"AZURE_VOICE_LIVE_WS_URL: {_ws_base}/voice-live/realtime?api-version=2025
 print(f"AZURE_SPEECH_KEY dlzka: {len(AZURE_SPEECH_KEY)} znakov")
 print(f"AZURE_OPENAI_KEY dlzka: {len(AZURE_OPENAI_KEY)} znakov")
 print(f"audioop dostupny: {'ano' if audioop else 'nie'}")
+print(f"PIPELINE_VERSION: {PIPELINE_VERSION}")
+print(f"DEEPGRAM_API_KEY nastavene: {'ano' if bool(DEEPGRAM_API_KEY) else 'nie'}")
+print(f"ELEVENLABS_API_KEY nastavene: {'ano' if bool(ELEVENLABS_API_KEY) else 'nie'}")
+print(f"ELEVENLABS_VOICE_ID: '{ELEVENLABS_VOICE_ID}'")
 print("----------------------")
 
 try:
