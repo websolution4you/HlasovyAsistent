@@ -455,7 +455,12 @@ def build_azure_session_config(phone_number: str = "") -> dict:
     return {
         "type": "session.update",
         "session": {
-            "turn_detection": {"type": "azure_semantic_vad"},
+            "turn_detection": {
+                "type": "azure_semantic_vad",
+                "threshold": 0.7,           # vyšší = menej citlivý na šum (default ~0.5)
+                "silence_duration_ms": 800, # čaká dlhšie než ukončí turn
+                "prefix_padding_ms": 300,   # ignoruje kratšie zvuky pred rečou
+            },
             "input_audio_format": "pcm16",
             "output_audio_format": "g711_ulaw",  # 8kHz mulaw — priamo Twilio formát, bez konverzie
             "input_audio_transcription": {
@@ -702,9 +707,11 @@ async def ws_voice(websocket: WebSocket):
 
                 elif msg_type == "conversation.item.input_audio_transcription.completed":
                     text = msg.get("transcript", "").strip()
-                    if text:
+                    if text and len(text.split()) >= 2:  # ignoruj jednoslovné halucinécie
                         transcript_lines.append(f"Zákazník: {text}")
                         print(f"[transcript] Zákazník: {text}")
+                    elif text:
+                        print(f"[transcript/skip] Zákazník (prilis kratke): {text}")
 
                 elif msg_type == "error":
                     print(f"[ws/voice] Azure chyba: {msg}")
