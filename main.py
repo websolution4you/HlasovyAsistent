@@ -206,14 +206,13 @@ def _get_streets_cached(tenant_id: str) -> list[str]:
 
 def format_menu_from_db(tenant_id: str) -> str:
     """Načíta menu_items z DB a naformátuje ako text pre system prompt."""
-    if not supabase or not tenant_id:
+    if not supabase:
         return ""
 
     try:
         result = (
             supabase.table("menu_items")
             .select("name, price, ingredients, allergens")
-            .eq("tenant_id", tenant_id)
             .order("price")
             .execute()
         )
