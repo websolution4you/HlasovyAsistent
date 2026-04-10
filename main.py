@@ -365,7 +365,7 @@ async def twilio_voice_webhook(request: Request):
 <Response>
     <Connect>
         <Stream url="{ws_endpoint}">
-            <Parameter name="phone_number" value="{{From}}" />
+            <Parameter name="phone_number" value="{{{{From}}}}" />
         </Stream>
     </Connect>
 </Response>'''
@@ -374,7 +374,7 @@ async def twilio_voice_webhook(request: Request):
 <Response>
     <Connect>
         <Stream url="wss://{host}/ws/voice">
-            <Parameter name="phone_number" value="{{From}}" />
+            <Parameter name="phone_number" value="{{{{From}}}}" />
         </Stream>
     </Connect>
 </Response>'''
@@ -803,20 +803,24 @@ _SENTENCE_RE = re.compile(r'(?<=[.?!;])\s+')
 
 
 async def _google_tts(text: str) -> bytes:
-    """Zavolá Google Cloud TTS REST API, vráti mulaw 8kHz audio bytes.
-    Používa SSML pre prirodzenejší hlas (pitch +2, rate 1.05).
-    """
-    ssml = f'<speak><prosody pitch="+2st" rate="1.05">{text}</prosody></speak>'
+    """Zavolá Google Cloud TTS REST API, vráti mulaw 8kHz audio bytes."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_TTS_API_KEY}",
             json={
-                "input": {"ssml": ssml},
+                "input": {"text": text},
                 "voice": {"languageCode": "sk-SK", "name": GOOGLE_TTS_VOICE},
-                "audioConfig": {"audioEncoding": "MULAW", "sampleRateHertz": 8000},
+                "audioConfig": {
+                    "audioEncoding": "MULAW",
+                    "sampleRateHertz": 8000,
+                    "speakingRate": 1.05,
+                    "pitch": 2.0,
+                },
             },
         )
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        print(f"[google-tts] HTTP {resp.status_code}: {resp.text[:300]}")
+        resp.raise_for_status()
     return base64.b64decode(resp.json().get("audioContent", ""))
 
 
@@ -1105,8 +1109,7 @@ async def ws_voice_v2(websocket: WebSocket):
                     full_transcript = " ".join(utterance_buffer).strip()
                     utterance_buffer.clear()
 
-                    if len(full_transcript.split()) < 2:
-                        print(f"[v2/transcript/skip] Zákazník (príliš krátke): {full_transcript}")
+                    if not full_transcript:
                         continue
 
                     print(f"[v2/transcript] Zákazník: {full_transcript}")
