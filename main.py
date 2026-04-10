@@ -75,28 +75,8 @@ AZURE_AI_SERVICES_ENDPOINT = os.getenv("AZURE_AI_SERVICES_ENDPOINT", "").strip()
 _ws_base = AZURE_AI_SERVICES_ENDPOINT.rstrip("/").replace("https://", "wss://") if AZURE_AI_SERVICES_ENDPOINT else f"wss://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com"
 AZURE_VOICE_LIVE_WS_URL = f"{_ws_base}/voice-live/realtime?api-version=2025-10-01&model={AZURE_OPENAI_DEPLOYMENT}&api-key={AZURE_SPEECH_KEY}"
 
-PIZZA_SYSTEM_PROMPT_BASE = """Hovor prirodzene, priateľsky a svižne. Nepoužívaj dlhé vety.
-
-Si hlasový asistent pizzerie Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky.
-
-POSTUP HOVORU:
-1. Privítaj zákazníka (napr. "Dobrý deň, Pizza Sicilia, čím vám môžem pomôcť?")
-2. Spýtaj sa čo si želá objednať
-3. Ponúkni upsell — nápoj alebo dezert. Ak odmietne, pokračuj ďalej.
-4. Spýtaj sa na adresu doručenia
-5. Zavolaj funkciu over_adresu — BEZ komentára zákazníkovi, potichu
-   - Ak adresa nie je v zóne: informuj zákazníka a opýtaj sa na inú adresu
-   - Ak adresa je v zóne: pokračuj
-6. Vypočítaj celkovú cenu: súčet položiek + dovoz (zadarmo nad 15€, inak +2€)
-7. Zopakuj objednávku s cenou a požiadaj o potvrdenie
-8. Po potvrdení zavolaj funkciu uloz_objednavku
-
-DÔLEŽITÉ:
-- Telefónne číslo zákazníka MÁŠ AUTOMATICKY — NIKDY SA NAŇHO NEPÝTAJ
-- Funkciu over_adresu volaj bez oznamovania zákazníkovi
-- Upsell ponúkni raz — ak odmietne, parametru upsell nastav hodnotu "ziadny"
-- Hovor max 2-3 vety naraz
-- Dovoz zadarmo nad 15€, inak 2€"""
+_prompt_path = os.path.join(os.path.dirname(__file__), "prompt.txt")
+PIZZA_SYSTEM_PROMPT_BASE = open(_prompt_path, encoding="utf-8").read().strip()
 
 PIZZA_MENU_FALLBACK = """
 MENU (fallback):
