@@ -659,17 +659,17 @@ def build_azure_session_config(phone_number: str = "") -> dict:
             "input_audio_noise_reduction": {
                 "type": "azure_deep_noise_suppression"
             },
-            # Aktívny hlas: multilingual HD — prirodzenejší, podporuje slovenčinu
+            # Aktívny hlas: natívny slovenský
             "voice": {
-                "name": "en-US-Andrew:DragonHDLatestNeural",
+                "name": "sk-SK-LukasNeural",
                 "type": "azure-standard",
-                "temperature": 0.8,
+                "rate": "1.1",
             },
-            # Záložný hlas: natívny slovenský (menej prirodzený)
+            # Záložný hlas: multilingual HD (americký prízvuk)
             # "voice": {
-            #     "name": "sk-SK-LukasNeural",
+            #     "name": "en-US-Andrew:DragonHDLatestNeural",
             #     "type": "azure-standard",
-            #     "rate": "1.1",
+            #     "temperature": 0.8,
             # },
             "instructions": PIZZA_SYSTEM_PROMPT,
             "tools": PIZZA_TOOLS,
@@ -755,6 +755,10 @@ async def ws_voice(websocket: WebSocket):
         session_cfg = build_azure_session_config(phone_number)
         print(f"[ws/voice] Posielam session.update: {json.dumps(session_cfg)}")
         await azure_ws.send(json.dumps(session_cfg))
+
+        # Spusti úvodné privítanie — agent hovorí prvý bez čakania na zákazníka
+        await azure_ws.send(json.dumps({"type": "response.create"}))
+        print("[ws/voice] Odoslany response.create — agent zacina sam")
 
         async def twilio_to_azure():
             """Číta správy od Twilia, konvertuje audio a posiela do Azure."""
