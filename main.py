@@ -817,23 +817,34 @@ def _build_deepgram_url() -> str:
     )
 
 
-# Regex pre delenie textu na vety (Google TTS — paralelné generovanie)
-_SENTENCE_RE = re.compile(r'(?<=[.?!;])\s+')
+# Regex pre delenie textu na vety (Google TTS — prirodzené hranice)
+_SENTENCE_RE = re.compile(r'(?<=[.?!;:])\s+')
+
+
+def normalize_tts_text(text: str) -> str:
+    """Normalizuje text pred TTS - odstráni duplicitné whitespace."""
+    return re.sub(r'\s+', ' ', text.strip())
 
 
 async def _google_tts(text: str) -> bytes:
-    """Zavolá Google Cloud TTS REST API, vráti mulaw 8kHz audio bytes."""
+    """Zavolá Google Cloud TTS REST API s SSML, vráti mulaw 8kHz audio bytes."""
+    # Vytvor SSML s jemnejšou prosodiou a pauzou
+    ssml = f"""<speak>
+  <prosody rate="96%" pitch="-1st">
+    {text}
+  </prosody>
+  <break time="250ms"/>
+</speak>"""
+    
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_TTS_API_KEY}",
             json={
-                "input": {"text": text},
+                "input": {"ssml": ssml},
                 "voice": {"languageCode": "sk-SK", "name": GOOGLE_TTS_VOICE},
                 "audioConfig": {
                     "audioEncoding": "MULAW",
                     "sampleRateHertz": 8000,
-                    "speakingRate": 1.05,
-                    "pitch": 2.0,
                 },
             },
         )
@@ -843,22 +854,71 @@ async def _google_tts(text: str) -> bytes:
     return base64.b64decode(resp.json().get("audioContent", ""))
 
 
-async def _tts_to_twilio(text: str, twilio_ws: WebSocket, stream_sid: str) -> None:
-    """Rozdelí text na vety, vygeneruje audio paralelne, pošle do Twilia v poradí."""
-    if not text.strip() or not stream_sid:
+async def safe_send_twilio(twilio_ws: WebSocket, payload: dict, stream_sid: str, connection_closed: asyncio.Event) -> bool:
+    """Bezpečne pošle správu do Twilio, chytí chyby pri zatvorenom spojení."""
+    if connection_closed.is_set():
+        return False
+    try:
+        await twilio_ws.send_text(json.dumps(payload))
+        return True
+    except Exception:
+        connection_closed.set()
+        return False
+
+
+async def _tts_to_twilio(text: str, twilio_ws: WebSocket, stream_sid: str, connection_closed: asyncio.Event, sent_sentences: set) -> None:
+    """Rozdelí text na vety, vygeneruje audio, pošle do Twilia. Zabráni duplicitám."""
+    if not text.strip() or not stream_sid or connection_closed.is_set():
         return
+    
+    # Normalizuj text
+    text = normalize_tts_text(text)
+    
+    # Rozdeľ na vety
     sentences = [s.strip() for s in _SENTENCE_RE.split(text) if s.strip()]
     if not sentences:
         sentences = [text.strip()]
-    print(f"[google-tts] {len(sentences)} viet → TTS")
-    audio_chunks = await asyncio.gather(*[_google_tts(s) for s in sentences])
-    for audio_bytes in audio_chunks:
-        if audio_bytes:
-            await twilio_ws.send_text(json.dumps({
-                "event": "media",
-                "streamSid": stream_sid,
-                "media": {"payload": base64.b64encode(audio_bytes).decode()},
-            }))
+    
+    # Filtruj duplicity
+    new_sentences = []
+    for sentence in sentences:
+        if sentence not in sent_sentences:
+            sent_sentences.add(sentence)
+            new_sentences.append(sentence)
+        else:
+            print(f"[tts] skipped duplicate sentence: {sentence[:50]}...")
+    
+    if not new_sentences:
+        return
+    
+    print(f"[tts] sending {len(new_sentences)} sentences")
+    
+    # Generuj audio pre každú vetu
+    for sentence in new_sentences:
+        if connection_closed.is_set():
+            print("[tts] aborted because connection closed")
+            return
+        
+        print(f"[tts] send sentence: {sentence[:80]}...")
+        try:
+            audio_bytes = await _google_tts(sentence)
+            if audio_bytes and not connection_closed.is_set():
+                success = await safe_send_twilio(
+                    twilio_ws,
+                    {
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {"payload": base64.b64encode(audio_bytes).decode()},
+                    },
+                    stream_sid,
+                    connection_closed
+                )
+                if not success:
+                    print("[tts] failed to send audio, connection closed")
+                    return
+        except Exception as e:
+            print(f"[tts] error generating audio: {e}")
+            continue
 
 
 async def _gpt_stream_and_tts(
@@ -868,14 +928,19 @@ async def _gpt_stream_and_tts(
     phone_number: str,
     transcript_lines: list,
     gpt_lock: asyncio.Lock,
+    connection_closed: asyncio.Event,
+    sent_sentences: set,
 ) -> list:
     """
     Zavolá GPT-4.1 (Azure) streaming, akumuluje text a generuje TTS cez Google Cloud.
-    Pre každú vetu volá Google TTS paralelne — nižšia latencia.
+    Pre každú vetu volá Google TTS sekvenčne — zabráni duplicitám.
     gpt_lock zabraňuje súbežným GPT+TTS volaniam.
     """
     try:
         async with gpt_lock:
+            if connection_closed.is_set():
+                return messages
+            
             azure_client = AzureOpenAI(
                 api_key=AZURE_OPENAI_KEY,
                 azure_endpoint=AZURE_OPENAI_ENDPOINT,
@@ -909,6 +974,9 @@ async def _gpt_stream_and_tts(
 
             # Iteratívna slučka pre tool cally
             while True:
+                if connection_closed.is_set():
+                    return messages
+                
                 stream = azure_client.chat.completions.create(
                     model=AZURE_OPENAI_DEPLOYMENT,
                     messages=messages,
@@ -922,7 +990,7 @@ async def _gpt_stream_and_tts(
                 if assistant_content:
                     transcript_lines.append(f"Agent: {assistant_content}")
                     print(f"[v2/transcript] Agent: {assistant_content}")
-                    await _tts_to_twilio(assistant_content, twilio_ws, stream_sid)
+                    await _tts_to_twilio(assistant_content, twilio_ws, stream_sid, connection_closed, sent_sentences)
 
                 # Žiadne tool cally — bežný turn hotový
                 if not tool_calls_acc:
@@ -968,7 +1036,7 @@ async def _gpt_stream_and_tts(
 
                 if should_hangup:
                     # Rozlúčkový turn — len ak GPT ešte nepovedal rozlúčku v assistant_content
-                    if not assistant_content:
+                    if not assistant_content and not connection_closed.is_set():
                         stream2 = azure_client.chat.completions.create(
                             model=AZURE_OPENAI_DEPLOYMENT,
                             messages=messages,
@@ -976,9 +1044,13 @@ async def _gpt_stream_and_tts(
                         )
                         farewell, _ = await _collect_gpt(stream2)
                         if farewell:
-                            await _tts_to_twilio(farewell, twilio_ws, stream_sid)
+                            await _tts_to_twilio(farewell, twilio_ws, stream_sid, connection_closed, sent_sentences)
                     await asyncio.sleep(4)
-                    await twilio_ws.close()
+                    connection_closed.set()
+                    try:
+                        await twilio_ws.close()
+                    except Exception:
+                        pass
                     return messages
 
                 # Pokračuj v slučke (GPT dostane výsledky toolov)
@@ -994,7 +1066,7 @@ async def _gpt_stream_and_tts(
 async def ws_voice_v2(websocket: WebSocket):
     """
     Custom pipeline: Twilio mulaw 8kHz → Deepgram STT → GPT-4.1 Azure → Google Cloud TTS → Twilio.
-    Google TTS: REST API, mulaw 8kHz, paralelné generovanie viet.
+    Google TTS: REST API, mulaw 8kHz, sekvenčné generovanie viet s ochranou proti duplicitám.
     """
     await websocket.accept()
     print("[ws/voice-v2] Twilio pripojeny")
@@ -1003,6 +1075,8 @@ async def ws_voice_v2(websocket: WebSocket):
     phone_number: str = ""
     transcript_lines: list = []
     gpt_lock = asyncio.Lock()  # len jeden GPT+TTS turn naraz
+    connection_closed = asyncio.Event()  # flag pre zatvorené spojenie
+    sent_sentences: set = set()  # tracking odoslaných viet
 
     # Konverzačný stav pre GPT
     menu_text = format_menu_from_db(TENANT_ID)
@@ -1038,12 +1112,14 @@ async def ws_voice_v2(websocket: WebSocket):
                 try:
                     raw = await websocket.receive_text()
                 except WebSocketDisconnect:
-                    print("[ws/voice-v2] Twilio odpojil")
+                    print("[twilio] websocket closed")
+                    connection_closed.set()
                     try:
                         await deepgram_ws.send(json.dumps({"type": "CloseStream"}))
                     except Exception:
                         pass
                     return
+                
                 msg = json.loads(raw)
                 event = msg.get("event")
 
@@ -1059,27 +1135,27 @@ async def ws_voice_v2(websocket: WebSocket):
                     # Okamžitý pozdrav priamo cez Google TTS — bez GPT cold start
                     GREETING = "Dobrý deň, Pizzeria Sicilia, akú pizzu si želáte?"
                     try:
-                        await _tts_to_twilio(GREETING, websocket, stream_sid)
+                        await _tts_to_twilio(GREETING, websocket, stream_sid, connection_closed, sent_sentences)
                         messages.append({"role": "assistant", "content": GREETING})
                         transcript_lines.append(f"Agent: {GREETING}")
                         print("[ws/voice-v2] pozdrav odoslaný")
                     except Exception as e:
                         print(f"[ws/voice-v2] chyba pozdrav TTS: {e}")
-                        # Fallback: nechaj GPT vygenerovať pozdrav
-                        asyncio.ensure_future(
-                            _gpt_stream_and_tts(messages, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
-                        )
 
                 elif event == "media":
+                    if connection_closed.is_set():
+                        return
                     mulaw_bytes = base64.b64decode(msg["media"]["payload"])
                     try:
                         await deepgram_ws.send(mulaw_bytes)
                     except Exception as e:
                         print(f"[ws/voice-v2] Deepgram send error: {e}")
+                        connection_closed.set()
                         return
 
                 elif event == "stop":
-                    print("[ws/voice-v2] Twilio stream stop")
+                    print("[twilio] stop received")
+                    connection_closed.set()
                     try:
                         await deepgram_ws.send(json.dumps({"type": "CloseStream"}))
                     except Exception:
@@ -1098,10 +1174,14 @@ async def ws_voice_v2(websocket: WebSocket):
             utterance_buffer: list[str] = []
 
             while True:
+                if connection_closed.is_set():
+                    return
+                
                 try:
                     raw = await deepgram_ws.recv()
                 except Exception as e:
                     print(f"[ws/voice-v2] Deepgram WS ukončil: {e}")
+                    connection_closed.set()
                     return
 
                 try:
@@ -1128,7 +1208,7 @@ async def ws_voice_v2(websocket: WebSocket):
                     full_transcript = " ".join(utterance_buffer).strip()
                     utterance_buffer.clear()
 
-                    if not full_transcript:
+                    if not full_transcript or connection_closed.is_set():
                         continue
 
                     print(f"[v2/transcript] Zákazník: {full_transcript}")
@@ -1137,7 +1217,10 @@ async def ws_voice_v2(websocket: WebSocket):
 
                     async def _run_gpt():
                         try:
-                            await _gpt_stream_and_tts(messages, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
+                            await _gpt_stream_and_tts(
+                                messages, websocket, stream_sid, phone_number, 
+                                transcript_lines, gpt_lock, connection_closed, sent_sentences
+                            )
                         except Exception as e:
                             import traceback
                             print(f"[v2/gpt_tts] ensure_future chyba: {e}")
@@ -1151,6 +1234,7 @@ async def ws_voice_v2(websocket: WebSocket):
 
     except Exception as e:
         print(f"[ws/voice-v2] chyba: {e}")
+        connection_closed.set()
     finally:
         if deepgram_ws:
             try:
