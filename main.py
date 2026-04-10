@@ -491,7 +491,7 @@ def build_azure_session_config(phone_number: str = "") -> dict:
     }
 
 
-async def handle_tool_call(tool_name: str, tool_args: dict, phone_number: str) -> str:
+async def handle_tool_call(tool_name: str, tool_args: dict, phone_number: str, transcript_lines: list = []) -> str:
     """Vykoná tool call od Azure agenta."""
     if tool_name == "over_adresu":
         raw_address = tool_args.get("address", "")
@@ -524,7 +524,7 @@ async def handle_tool_call(tool_name: str, tool_args: dict, phone_number: str) -
                 "upsell_offered": tool_args.get("upsell", "ziadny") != "ziadny",
                 "upsell_item": tool_args.get("upsell") or None,
                 "upsell_accepted": tool_args.get("upsell", "ziadny") != "ziadny",
-                "notes": None,
+                "notes": "\n".join(transcript_lines) or None,
                 "status": "NEW",
             }
             supabase.table("pizza_orders").insert(order_data).execute()
@@ -557,6 +557,7 @@ async def ws_voice(websocket: WebSocket):
     phone_number: str = ""
     azure_ws = None
     pending_tool_calls: dict = {}  # call_id -> {name, args_acc}
+    transcript_lines: list = []    # akumulovaný prepis hovoru
 
     try:
         # Otvor spojenie s Azure Voice Live API
@@ -625,7 +626,7 @@ async def ws_voice(websocket: WebSocket):
 
         async def azure_to_twilio():
             """Číta správy od Azure, konvertuje audio a posiela späť do Twilia."""
-            nonlocal pending_tool_calls
+            nonlocal pending_tool_calls, transcript_lines
             while True:
                 try:
                     raw = await azure_ws.recv()
@@ -667,7 +668,7 @@ async def ws_voice(websocket: WebSocket):
                         tool_args = {}
 
                     print(f"[ws/voice] tool_call name={tool_name} args={tool_args}")
-                    result_str = await handle_tool_call(tool_name, tool_args, phone_number)
+                    result_str = await handle_tool_call(tool_name, tool_args, phone_number, transcript_lines)
 
                     # Pošli výsledok toolcallu späť do Azure
                     await azure_ws.send(json.dumps({
@@ -685,6 +686,18 @@ async def ws_voice(websocket: WebSocket):
                         print("[ws/voice] ukonci_hovor — zatvaram spojenie")
                         await websocket.close()
                         return
+
+                elif msg_type == "response.audio_transcript.done":
+                    text = msg.get("transcript", "").strip()
+                    if text:
+                        transcript_lines.append(f"Agent: {text}")
+                        print(f"[transcript] Agent: {text}")
+
+                elif msg_type == "conversation.item.input_audio_transcription.completed":
+                    text = msg.get("transcript", "").strip()
+                    if text:
+                        transcript_lines.append(f"Zákazník: {text}")
+                        print(f"[transcript] Zákazník: {text}")
 
                 elif msg_type == "error":
                     print(f"[ws/voice] Azure chyba: {msg}")
