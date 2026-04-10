@@ -116,6 +116,12 @@ PIZZA_TOOLS = [
             "required": ["pizza_type", "upsell", "address", "total_price"],
         },
     },
+    {
+        "type": "function",
+        "name": "ukonci_hovor",
+        "description": "Ukončí telefonický hovor. Volaj po rozlúčke so zákazníkom.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -211,6 +217,7 @@ def format_menu_from_db(tenant_id: str) -> str:
             .order("price")
             .execute()
         )
+        print(f"[menu] načítané položky ({len(result.data)}): {[i['name'] for i in result.data]}")
         if not result.data:
             return ""
 
@@ -460,15 +467,15 @@ def build_azure_session_config(phone_number: str = "") -> dict:
             "input_audio_noise_reduction": {
                 "type": "azure_deep_noise_suppression"
             },
-            # Aktívny hlas: natívny slovenský (mužský)
+            # Aktívny hlas: natívny slovenský (ženský)
             "voice": {
-                "name": "sk-SK-LukasNeural",
+                "name": "sk-SK-ViktoriaNeural",
                 "type": "azure-standard",
                 "rate": "1.1",
             },
-            # Záložný hlas: natívny slovenský (ženský)
+            # Záložný hlas: natívny slovenský (mužský)
             # "voice": {
-            #     "name": "sk-SK-ViktoriaNeural",
+            #     "name": "sk-SK-LukasNeural",
             #     "type": "azure-standard",
             #     "rate": "1.1",
             # },
@@ -527,6 +534,9 @@ async def handle_tool_call(tool_name: str, tool_args: dict, phone_number: str) -
         except Exception as e:
             print(f"[tool] uloz_objednavku chyba: {e}")
             return json.dumps({"status": "error", "message": str(e)})
+
+    if tool_name == "ukonci_hovor":
+        return json.dumps({"status": "ok"})
 
     return json.dumps({"status": "error", "message": f"Neznámy tool: {tool_name}"})
 
@@ -670,6 +680,12 @@ async def ws_voice(websocket: WebSocket):
                         },
                     }))
                     await azure_ws.send(json.dumps({"type": "response.create"}))
+
+                    if tool_name == "ukonci_hovor":
+                        await asyncio.sleep(3)  # nechaj agenta dohovoriť rozlúčku
+                        print("[ws/voice] ukonci_hovor — zatvaram spojenie")
+                        await websocket.close()
+                        return
 
                 elif msg_type == "error":
                     print(f"[ws/voice] Azure chyba: {msg}")
