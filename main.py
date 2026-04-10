@@ -411,6 +411,26 @@ async def twilio_status_webhook(request: Request):
     return {"status": "ok"}
 
 
+@app.get("/api/elevenlabs-voices")
+async def elevenlabs_voices():
+    """Debug endpoint — vypíše hlasy dostupné pre aktuálny ELEVENLABS_API_KEY."""
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY nie je nastavený.")
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://api.elevenlabs.io/v1/voices",
+            headers={"xi-api-key": ELEVENLABS_API_KEY},
+            timeout=10,
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    return [
+        {"voice_id": v["voice_id"], "name": v["name"], "category": v.get("category", "")}
+        for v in data.get("voices", [])
+    ]
+
+
 @app.post("/api/search-street")
 async def search_street(body: SearchStreetRequest):
     """Fuzzy vyhľadávanie ulice — cachuje ulice z DB na 5 minút, vracia max 2 zhody so skóre ≥ 55."""
