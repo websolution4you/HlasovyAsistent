@@ -775,7 +775,7 @@ PIZZA_TOOLS_OPENAI = [
 
 
 def _build_deepgram_url() -> str:
-    keywords_qs = "&".join(f"keywords={k}:2" for k in DEEPGRAM_KEYWORDS)
+    keywords_qs = "&".join(f"keyterm={k}" for k in DEEPGRAM_KEYWORDS)
     return (
         f"wss://api.deepgram.com/v1/listen"
         f"?model=nova-3"
