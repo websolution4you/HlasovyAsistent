@@ -1,10 +1,12 @@
 import os
+import re
 import time
 import asyncio
 import unicodedata
 import json
 import base64
 from typing import Optional
+import httpx
 from rapidfuzz import fuzz, process
 import websockets
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -66,10 +68,10 @@ SUPABASE_KEY = os.getenv("CORE_SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 TENANT_ID = os.getenv("TENANT_ID", "").strip()
 
-# --- CUSTOM PIPELINE (Deepgram + GPT-4.1 + ElevenLabs) ---
+# --- CUSTOM PIPELINE (Deepgram + GPT-4.1 + Google TTS) ---
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM").strip()
+GOOGLE_TTS_API_KEY = os.getenv("GOOGLE_TTS_API_KEY", "").strip()
+GOOGLE_TTS_VOICE = os.getenv("GOOGLE_TTS_VOICE", "sk-SK-Wavenet-A").strip()
 PIPELINE_VERSION = os.getenv("PIPELINE_VERSION", "azure").strip()  # "azure" alebo "custom"
 
 DEEPGRAM_KEYWORDS = [
@@ -165,8 +167,8 @@ print(f"AZURE_OPENAI_KEY dlzka: {len(AZURE_OPENAI_KEY)} znakov")
 print(f"audioop dostupny: {'ano' if audioop else 'nie'}")
 print(f"PIPELINE_VERSION: {PIPELINE_VERSION}")
 print(f"DEEPGRAM_API_KEY nastavene: {'ano' if bool(DEEPGRAM_API_KEY) else 'nie'}")
-print(f"ELEVENLABS_API_KEY nastavene: {'ano' if bool(ELEVENLABS_API_KEY) else 'nie'}")
-print(f"ELEVENLABS_VOICE_ID: '{ELEVENLABS_VOICE_ID}'")
+print(f"GOOGLE_TTS_API_KEY nastavene: {'ano' if bool(GOOGLE_TTS_API_KEY) else 'nie'}")
+print(f"GOOGLE_TTS_VOICE: {GOOGLE_TTS_VOICE}")
 print("----------------------")
 
 try:
@@ -410,25 +412,6 @@ async def twilio_status_webhook(request: Request):
     print(f"Twilio status callback: {payload}")
     return {"status": "ok"}
 
-
-@app.get("/api/elevenlabs-voices")
-async def elevenlabs_voices():
-    """Debug endpoint — vypíše hlasy dostupné pre aktuálny ELEVENLABS_API_KEY."""
-    if not ELEVENLABS_API_KEY:
-        raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY nie je nastavený.")
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://api.elevenlabs.io/v1/voices",
-            headers={"xi-api-key": ELEVENLABS_API_KEY},
-            timeout=10,
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    data = resp.json()
-    return [
-        {"voice_id": v["voice_id"], "name": v["name"], "category": v.get("category", "")}
-        for v in data.get("voices", [])
-    ]
 
 
 @app.post("/api/search-street")
@@ -815,17 +798,45 @@ def _build_deepgram_url() -> str:
     )
 
 
-def _build_elevenlabs_url() -> str:
-    return (
-        f"wss://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream-input"
-        f"?model_id=eleven_multilingual_v2"
-        f"&output_format=ulaw_8000"
-    )
+# Regex pre delenie textu na vety (Google TTS — paralelné generovanie)
+_SENTENCE_RE = re.compile(r'(?<=[.?!;])\s+')
+
+
+async def _google_tts(text: str) -> bytes:
+    """Zavolá Google Cloud TTS REST API, vráti mulaw 8kHz audio bytes."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_TTS_API_KEY}",
+            json={
+                "input": {"text": text},
+                "voice": {"languageCode": "sk-SK", "name": GOOGLE_TTS_VOICE},
+                "audioConfig": {"audioEncoding": "MULAW", "sampleRateHertz": 8000},
+            },
+        )
+    resp.raise_for_status()
+    return base64.b64decode(resp.json().get("audioContent", ""))
+
+
+async def _tts_to_twilio(text: str, twilio_ws: WebSocket, stream_sid: str) -> None:
+    """Rozdelí text na vety, vygeneruje audio paralelne, pošle do Twilia v poradí."""
+    if not text.strip() or not stream_sid:
+        return
+    sentences = [s.strip() for s in _SENTENCE_RE.split(text) if s.strip()]
+    if not sentences:
+        sentences = [text.strip()]
+    print(f"[google-tts] {len(sentences)} viet → TTS")
+    audio_chunks = await asyncio.gather(*[_google_tts(s) for s in sentences])
+    for audio_bytes in audio_chunks:
+        if audio_bytes:
+            await twilio_ws.send_text(json.dumps({
+                "event": "media",
+                "streamSid": stream_sid,
+                "media": {"payload": base64.b64encode(audio_bytes).decode()},
+            }))
 
 
 async def _gpt_stream_and_tts(
     messages: list,
-    el_ws,
     twilio_ws: WebSocket,
     stream_sid: str,
     phone_number: str,
@@ -833,12 +844,9 @@ async def _gpt_stream_and_tts(
     gpt_lock: asyncio.Lock,
 ) -> list:
     """
-    Zavolá GPT-4.1 (Azure) streaming, posielá text chunky do ElevenLabs,
-    spracuje tool cally. Vráti aktualizovaný messages list.
-
-    DÔLEŽITÉ: el_ws zostáva otvorený počas celého hovoru — {"text": ""} sa
-    posiela LEN pri ukonci_hovor. Medzi turnmi sa WS nezatvára.
-    gpt_lock zabraňuje súbežným GPT volaniam na ten istý el_ws.
+    Zavolá GPT-4.1 (Azure) streaming, akumuluje text a generuje TTS cez Google Cloud.
+    Pre každú vetu volá Google TTS paralelne — nižšia latencia.
+    gpt_lock zabraňuje súbežným GPT+TTS volaniam.
     """
     async with gpt_lock:
         azure_client = AzureOpenAI(
@@ -847,31 +855,17 @@ async def _gpt_stream_and_tts(
             api_version="2025-01-01-preview",
         )
 
-        async def _stream_to_elevenlabs(gpt_stream) -> tuple[str, dict]:
-            """Streamuje GPT odpoveď do ElevenLabs, vracia (text, tool_calls_acc)."""
+        async def _collect_gpt(gpt_stream) -> tuple[str, dict]:
+            """Akumuluje GPT odpoveď, vracia (text, tool_calls_acc)."""
             assistant_text_chunks: list[str] = []
             tool_calls_acc: dict = {}
-            chunk_buffer = ""
 
             for chunk in gpt_stream:
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if delta is None:
                     continue
-
                 if delta.content:
-                    text = delta.content
-                    assistant_text_chunks.append(text)
-                    chunk_buffer += text
-                    # Flush na interpunkciu (prirodzený boundary)
-                    if any(chunk_buffer.rstrip().endswith(p) for p in [".", ",", "?", "!", ":", ";", "—", "€"]):
-                        if chunk_buffer.strip():
-                            await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
-                            chunk_buffer = ""
-                    # Safety flush ak buffer je veľmi dlhý (bez interpunkcie) — ale len na hranici slova
-                    elif len(chunk_buffer) > 120 and chunk_buffer.endswith(" "):
-                        await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
-                        chunk_buffer = ""
-
+                    assistant_text_chunks.append(delta.content)
                 if delta.tool_calls:
                     for tc in delta.tool_calls:
                         idx = tc.index
@@ -884,11 +878,7 @@ async def _gpt_stream_and_tts(
                         if tc.function and tc.function.arguments:
                             tool_calls_acc[idx]["args"] += tc.function.arguments
 
-            # Flush zvyšok
-            if chunk_buffer.strip():
-                await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
-
-            return "".join(assistant_text_chunks), tool_calls_acc
+            return "".join(assistant_text_chunks).strip(), tool_calls_acc
 
         # Iteratívna slučka pre tool cally
         while True:
@@ -900,13 +890,14 @@ async def _gpt_stream_and_tts(
                 stream=True,
             )
 
-            assistant_content, tool_calls_acc = await _stream_to_elevenlabs(stream)
+            assistant_content, tool_calls_acc = await _collect_gpt(stream)
 
             if assistant_content:
                 transcript_lines.append(f"Agent: {assistant_content}")
                 print(f"[v2/transcript] Agent: {assistant_content}")
+                await _tts_to_twilio(assistant_content, twilio_ws, stream_sid)
 
-            # Žiadne tool cally — bežný turn hotový, WS zostáva otvorený
+            # Žiadne tool cally — bežný turn hotový
             if not tool_calls_acc:
                 if assistant_content:
                     messages.append({"role": "assistant", "content": assistant_content})
@@ -949,16 +940,17 @@ async def _gpt_stream_and_tts(
                     should_hangup = True
 
             if should_hangup:
-                # Rozlúčkový turn
-                stream2 = azure_client.chat.completions.create(
-                    model=AZURE_OPENAI_DEPLOYMENT,
-                    messages=messages,
-                    stream=True,
-                )
-                await _stream_to_elevenlabs(stream2)
-                # Teraz zatvor ElevenLabs stream — koniec hovoru
-                await el_ws.send(json.dumps({"text": ""}))
-                await asyncio.sleep(3)
+                # Rozlúčkový turn — len ak GPT ešte nepovedal rozlúčku v assistant_content
+                if not assistant_content:
+                    stream2 = azure_client.chat.completions.create(
+                        model=AZURE_OPENAI_DEPLOYMENT,
+                        messages=messages,
+                        stream=True,
+                    )
+                    farewell, _ = await _collect_gpt(stream2)
+                    if farewell:
+                        await _tts_to_twilio(farewell, twilio_ws, stream_sid)
+                await asyncio.sleep(4)
                 await twilio_ws.close()
                 return messages
 
@@ -968,8 +960,8 @@ async def _gpt_stream_and_tts(
 @app.websocket("/ws/voice-v2")
 async def ws_voice_v2(websocket: WebSocket):
     """
-    Custom pipeline: Twilio mulaw 8kHz → Deepgram STT → GPT-4.1 Azure → ElevenLabs TTS → Twilio.
-    Bez audio konverzie — Deepgram aj ElevenLabs pracujú s mulaw 8kHz natívne.
+    Custom pipeline: Twilio mulaw 8kHz → Deepgram STT → GPT-4.1 Azure → Google Cloud TTS → Twilio.
+    Google TTS: REST API, mulaw 8kHz, paralelné generovanie viet.
     """
     await websocket.accept()
     print("[ws/voice-v2] Twilio pripojeny")
@@ -985,13 +977,11 @@ async def ws_voice_v2(websocket: WebSocket):
     messages: list = [{"role": "system", "content": system_instructions}]
 
     deepgram_ws = None
-    el_ws = None
 
     try:
         # --- Otvoriť Deepgram WebSocket ---
         dg_url = _build_deepgram_url()
-        dg_url_log = dg_url  # API kľúč nie je v URL, je v headeri
-        print(f"[ws/voice-v2] Pripájam Deepgram: {dg_url_log}")
+        print(f"[ws/voice-v2] Pripájam Deepgram: {dg_url}")
         try:
             deepgram_ws = await websockets.connect(
                 dg_url,
@@ -1008,23 +998,6 @@ async def ws_voice_v2(websocket: WebSocket):
             raise
         print("[ws/voice-v2] Deepgram pripojený")
 
-        # --- Otvoriť ElevenLabs WebSocket ---
-        el_url = _build_elevenlabs_url()
-        print(f"[ws/voice-v2] Pripájam ElevenLabs: {el_url.split('?')[0]}")
-        el_ws = await websockets.connect(
-            el_url,
-            additional_headers={"xi-api-key": ELEVENLABS_API_KEY},
-            max_size=10 * 1024 * 1024,
-        )
-        print("[ws/voice-v2] ElevenLabs pripojený")
-
-        # Inicializácia ElevenLabs session
-        await el_ws.send(json.dumps({
-            "text": " ",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
-            "generation_config": {"chunk_length_schedule": [50, 100, 150, 200]},
-        }))
-
         async def twilio_to_deepgram():
             """Číta audio z Twilia a posiela priamo do Deepgram (mulaw 8kHz, bez konverzie)."""
             nonlocal stream_sid, phone_number
@@ -1033,7 +1006,6 @@ async def ws_voice_v2(websocket: WebSocket):
                     raw = await websocket.receive_text()
                 except WebSocketDisconnect:
                     print("[ws/voice-v2] Twilio odpojil")
-                    # Pošli Deepgramu keepalive close
                     try:
                         await deepgram_ws.send(json.dumps({"type": "CloseStream"}))
                     except Exception:
@@ -1050,17 +1022,14 @@ async def ws_voice_v2(websocket: WebSocket):
                         or start_data.get("from", "")
                     )
                     print(f"[ws/voice-v2] stream started sid={stream_sid} phone={phone_number}")
-                    print(f"[ws/voice-v2] start payload keys: {list(start_data.keys())}")
 
                     # Pozdravný turn — agent začína hovor
                     asyncio.ensure_future(
-                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
+                        _gpt_stream_and_tts(messages, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
                     )
 
                 elif event == "media":
-                    mulaw_b64 = msg["media"]["payload"]
-                    mulaw_bytes = base64.b64decode(mulaw_b64)
-                    # Posielaj priamo do Deepgram — žiadna konverzia
+                    mulaw_bytes = base64.b64decode(msg["media"]["payload"])
                     try:
                         await deepgram_ws.send(mulaw_bytes)
                     except Exception as e:
@@ -1112,7 +1081,6 @@ async def ws_voice_v2(websocket: WebSocket):
                         utterance_buffer.append(transcript)
 
                 elif msg_type == "UtteranceEnd":
-                    # Zákazník prestal hovoriť — spusti GPT so všetkým čo sme zachytili
                     if not utterance_buffer:
                         continue
                     full_transcript = " ".join(utterance_buffer).strip()
@@ -1127,65 +1095,22 @@ async def ws_voice_v2(websocket: WebSocket):
                     messages.append({"role": "user", "content": full_transcript})
 
                     asyncio.ensure_future(
-                        _gpt_stream_and_tts(messages, el_ws, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
+                        _gpt_stream_and_tts(messages, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
                     )
-
-        async def elevenlabs_to_twilio():
-            """Číta audio z ElevenLabs a posiela priamo do Twilia (ulaw 8kHz, bez konverzie)."""
-            while True:
-                try:
-                    raw = await el_ws.recv()
-                except Exception as e:
-                    print(f"[ws/voice-v2] ElevenLabs WS ukončil: {e}")
-                    return
-
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    # Binárne dáta — priamo audio (ElevenLabs niekedy posiela raw bytes)
-                    if isinstance(raw, bytes) and stream_sid:
-                        audio_b64 = base64.b64encode(raw).decode()
-                        await websocket.send_text(json.dumps({
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": audio_b64},
-                        }))
-                    continue
-
-                if msg.get("audio") and stream_sid:
-                    await websocket.send_text(json.dumps({
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": msg["audio"]},
-                    }))
-                elif msg.get("isFinal"):
-                    print("[ws/voice-v2] ElevenLabs: koniec audio streamu")
-
-        async def elevenlabs_keepalive():
-            """Posiela prázdny text každých 10s aby ElevenLabs WS nezatvoril spojenie (timeout 20s)."""
-            while True:
-                await asyncio.sleep(10)
-                try:
-                    await el_ws.send(json.dumps({"text": " "}))
-                except Exception:
-                    return
 
         await asyncio.gather(
             twilio_to_deepgram(),
             deepgram_to_gpt(),
-            elevenlabs_to_twilio(),
-            elevenlabs_keepalive(),
         )
 
     except Exception as e:
         print(f"[ws/voice-v2] chyba: {e}")
     finally:
-        for ws in [deepgram_ws, el_ws]:
-            if ws:
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
+        if deepgram_ws:
+            try:
+                await deepgram_ws.close()
+            except Exception:
+                pass
         print("[ws/voice-v2] spojenie ukončené")
 
 
