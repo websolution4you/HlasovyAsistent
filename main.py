@@ -259,7 +259,7 @@ def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
     """Fuzzy match adresy voči tabuľke ulíc. Vracia (matched_address, confidence 0-1).
     Podporuje čísla ako cifry aj slová (napr. 'Dlhá tri', 'Levočská dvanásť').
     """
-    if not supabase or not tenant_id:
+    if not supabase:
         return raw_address, 0
 
     try:
@@ -273,18 +273,14 @@ def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
         address = raw_address.strip()
         parts = address.rsplit(maxsplit=1)
 
-        # Kandidáti na street_part + house_number:
-        # 1. Posledné slovo je číslica (napr. "Dlhá 5")
-        # 2. Posledné slovo nie je číslica ale adresa má viac slov (napr. "Dlhá tri")
-        # 3. Celá adresa je len jeden výraz (napr. "Rozvoj")
         candidates = []
         if len(parts) == 2:
-            candidates.append((parts[0], parts[1]))  # bez posledného slova
-        candidates.append((address, ""))  # celá adresa bez čísla
+            candidates.append((parts[0], parts[1]))  # bez posledného slova (číslo domu)
+        candidates.append((address, ""))  # celá adresa
 
         for street_part, house_number in candidates:
             results = process.extractOne(
-                street_part.lower(), street_names_lower.keys(), score_cutoff=60
+                street_part.lower(), street_names_lower.keys(), score_cutoff=45
             )
             matches = [results[0]] if results else []
             if matches:
@@ -293,7 +289,9 @@ def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
                 print(f"Address match: '{address}' -> '{matched_address}'")
                 return matched_address, 1
 
-        print(f"Address no match: '{address}'")
+        # Žiadna zhoda — vráť top výsledok ak aspoň niečo nájde (pre debug)
+        top = process.extractOne(address.lower(), street_names_lower.keys())
+        print(f"Address no match: '{address}' | best candidate: {top}")
         return raw_address, 0
     except Exception as e:
         print(f"Chyba pri matchovani adresy: {e}")
@@ -466,12 +464,18 @@ def build_azure_session_config(phone_number: str = "") -> dict:
             "input_audio_noise_reduction": {
                 "type": "azure_deep_noise_suppression"
             },
-            # Aktívny hlas: natívny slovenský (ženský)
+            # Aktívny hlas: český (na testovanie — prirodzenejší TTS)
             "voice": {
-                "name": "sk-SK-ViktoriaNeural",
+                "name": "cs-CZ-VlastaNeural",
                 "type": "azure-standard",
                 "rate": "1.1",
             },
+            # Záložný hlas: natívny slovenský (ženský)
+            # "voice": {
+            #     "name": "sk-SK-ViktoriaNeural",
+            #     "type": "azure-standard",
+            #     "rate": "1.1",
+            # },
             # Záložný hlas: natívny slovenský (mužský)
             # "voice": {
             #     "name": "sk-SK-LukasNeural",
