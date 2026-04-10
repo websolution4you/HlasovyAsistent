@@ -82,10 +82,11 @@ PIZZA_MENU_FALLBACK = """
 MENU (fallback):
 | Pizza | Cena |
 |-------|------|
-| Margherita | 6.90€ |
-| Šunková | 7.50€ |
-| Diavola | 8.20€ |
-| Quattro Formaggi | 8.90€ |"""
+| Margherita | 6.50€ |
+| Salami | 7.50€ |
+| Hawaii | 7.90€ |
+| Pepperoni | 9.90€ |
+| Quattro Formaggi | 9.50€ |"""
 
 PIZZA_TOOLS = [
     {
