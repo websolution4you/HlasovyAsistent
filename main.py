@@ -362,7 +362,9 @@ async def twilio_voice_webhook(request: Request):
         twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="{ws_endpoint}" />
+        <Stream url="{ws_endpoint}">
+            <Parameter name="phone_number" value="{{{{From}}}}" />
+        </Stream>
     </Connect>
 </Response>'''
     elif AZURE_SPEECH_KEY and AZURE_OPENAI_KEY:
@@ -1038,10 +1040,9 @@ async def ws_voice_v2(websocket: WebSocket):
                 if event == "start":
                     start_data = msg["start"]
                     stream_sid = start_data.get("streamSid", "")
-                    # Twilio posiela číslo volajúceho v start.from (nie cez <Parameter> — ten nepodporuje substitúciu)
                     phone_number = (
-                        start_data.get("from", "")
-                        or start_data.get("customParameters", {}).get("phone_number", "")
+                        start_data.get("customParameters", {}).get("phone_number", "")
+                        or start_data.get("from", "")
                     )
                     print(f"[ws/voice-v2] stream started sid={stream_sid} phone={phone_number}")
                     print(f"[ws/voice-v2] start payload keys: {list(start_data.keys())}")
@@ -1155,10 +1156,20 @@ async def ws_voice_v2(websocket: WebSocket):
                 elif msg.get("isFinal"):
                     print("[ws/voice-v2] ElevenLabs: koniec audio streamu")
 
+        async def elevenlabs_keepalive():
+            """Posiela prázdny text každých 10s aby ElevenLabs WS nezatvoril spojenie (timeout 20s)."""
+            while True:
+                await asyncio.sleep(10)
+                try:
+                    await el_ws.send(json.dumps({"text": " "}))
+                except Exception:
+                    return
+
         await asyncio.gather(
             twilio_to_deepgram(),
             deepgram_to_gpt(),
             elevenlabs_to_twilio(),
+            elevenlabs_keepalive(),
         )
 
     except Exception as e:
