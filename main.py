@@ -365,7 +365,7 @@ async def twilio_voice_webhook(request: Request):
 <Response>
     <Connect>
         <Stream url="{ws_endpoint}">
-            <Parameter name="phone_number" value="{{{{From}}}}" />
+            <Parameter name="phone_number" value="{{From}}" />
         </Stream>
     </Connect>
 </Response>'''
@@ -374,7 +374,7 @@ async def twilio_voice_webhook(request: Request):
 <Response>
     <Connect>
         <Stream url="wss://{host}/ws/voice">
-            <Parameter name="phone_number" value="{{{{From}}}}" />
+            <Parameter name="phone_number" value="{{From}}" />
         </Stream>
     </Connect>
 </Response>'''
@@ -803,12 +803,15 @@ _SENTENCE_RE = re.compile(r'(?<=[.?!;])\s+')
 
 
 async def _google_tts(text: str) -> bytes:
-    """Zavolá Google Cloud TTS REST API, vráti mulaw 8kHz audio bytes."""
+    """Zavolá Google Cloud TTS REST API, vráti mulaw 8kHz audio bytes.
+    Používa SSML pre prirodzenejší hlas (pitch +2, rate 1.05).
+    """
+    ssml = f'<speak><prosody pitch="+2st" rate="1.05">{text}</prosody></speak>'
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_TTS_API_KEY}",
             json={
-                "input": {"text": text},
+                "input": {"ssml": ssml},
                 "voice": {"languageCode": "sk-SK", "name": GOOGLE_TTS_VOICE},
                 "audioConfig": {"audioEncoding": "MULAW", "sampleRateHertz": 8000},
             },
@@ -848,113 +851,120 @@ async def _gpt_stream_and_tts(
     Pre každú vetu volá Google TTS paralelne — nižšia latencia.
     gpt_lock zabraňuje súbežným GPT+TTS volaniam.
     """
-    async with gpt_lock:
-        azure_client = AzureOpenAI(
-            api_key=AZURE_OPENAI_KEY,
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            api_version="2025-01-01-preview",
-        )
-
-        async def _collect_gpt(gpt_stream) -> tuple[str, dict]:
-            """Akumuluje GPT odpoveď, vracia (text, tool_calls_acc)."""
-            assistant_text_chunks: list[str] = []
-            tool_calls_acc: dict = {}
-
-            for chunk in gpt_stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta is None:
-                    continue
-                if delta.content:
-                    assistant_text_chunks.append(delta.content)
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {"id": "", "name": "", "args": ""}
-                        if tc.id:
-                            tool_calls_acc[idx]["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            tool_calls_acc[idx]["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            tool_calls_acc[idx]["args"] += tc.function.arguments
-
-            return "".join(assistant_text_chunks).strip(), tool_calls_acc
-
-        # Iteratívna slučka pre tool cally
-        while True:
-            stream = azure_client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT,
-                messages=messages,
-                tools=PIZZA_TOOLS_OPENAI,
-                tool_choice="auto",
-                stream=True,
+    try:
+        async with gpt_lock:
+            azure_client = AzureOpenAI(
+                api_key=AZURE_OPENAI_KEY,
+                azure_endpoint=AZURE_OPENAI_ENDPOINT,
+                api_version="2025-01-01-preview",
             )
 
-            assistant_content, tool_calls_acc = await _collect_gpt(stream)
+            async def _collect_gpt(gpt_stream) -> tuple[str, dict]:
+                """Akumuluje GPT odpoveď, vracia (text, tool_calls_acc)."""
+                assistant_text_chunks: list[str] = []
+                tool_calls_acc: dict = {}
 
-            if assistant_content:
-                transcript_lines.append(f"Agent: {assistant_content}")
-                print(f"[v2/transcript] Agent: {assistant_content}")
-                await _tts_to_twilio(assistant_content, twilio_ws, stream_sid)
+                for chunk in gpt_stream:
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta is None:
+                        continue
+                    if delta.content:
+                        assistant_text_chunks.append(delta.content)
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {"id": "", "name": "", "args": ""}
+                            if tc.id:
+                                tool_calls_acc[idx]["id"] = tc.id
+                            if tc.function and tc.function.name:
+                                tool_calls_acc[idx]["name"] = tc.function.name
+                            if tc.function and tc.function.arguments:
+                                tool_calls_acc[idx]["args"] += tc.function.arguments
 
-            # Žiadne tool cally — bežný turn hotový
-            if not tool_calls_acc:
+                return "".join(assistant_text_chunks).strip(), tool_calls_acc
+
+            # Iteratívna slučka pre tool cally
+            while True:
+                stream = azure_client.chat.completions.create(
+                    model=AZURE_OPENAI_DEPLOYMENT,
+                    messages=messages,
+                    tools=PIZZA_TOOLS_OPENAI,
+                    tool_choice="auto",
+                    stream=True,
+                )
+
+                assistant_content, tool_calls_acc = await _collect_gpt(stream)
+
                 if assistant_content:
-                    messages.append({"role": "assistant", "content": assistant_content})
-                return messages
+                    transcript_lines.append(f"Agent: {assistant_content}")
+                    print(f"[v2/transcript] Agent: {assistant_content}")
+                    await _tts_to_twilio(assistant_content, twilio_ws, stream_sid)
 
-            # Spracuj tool cally
-            tool_call_items = []
-            for idx in sorted(tool_calls_acc.keys()):
-                tc = tool_calls_acc[idx]
-                tool_call_items.append({
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {"name": tc["name"], "arguments": tc["args"]},
-                })
+                # Žiadne tool cally — bežný turn hotový
+                if not tool_calls_acc:
+                    if assistant_content:
+                        messages.append({"role": "assistant", "content": assistant_content})
+                    return messages
 
-            messages.append({
-                "role": "assistant",
-                "content": assistant_content or None,
-                "tool_calls": tool_call_items,
-            })
-
-            should_hangup = False
-            for tc_item in tool_call_items:
-                tool_name = tc_item["function"]["name"]
-                try:
-                    tool_args = json.loads(tc_item["function"]["arguments"])
-                except Exception:
-                    tool_args = {}
-
-                print(f"[v2/tool_call] name={tool_name} args={tool_args}")
-                result_str = await handle_tool_call(tool_name, tool_args, phone_number, transcript_lines)
+                # Spracuj tool cally
+                tool_call_items = []
+                for idx in sorted(tool_calls_acc.keys()):
+                    tc = tool_calls_acc[idx]
+                    tool_call_items.append({
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["args"]},
+                    })
 
                 messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc_item["id"],
-                    "content": result_str,
+                    "role": "assistant",
+                    "content": assistant_content or None,
+                    "tool_calls": tool_call_items,
                 })
 
-                if tool_name == "ukonci_hovor":
-                    should_hangup = True
+                should_hangup = False
+                for tc_item in tool_call_items:
+                    tool_name = tc_item["function"]["name"]
+                    try:
+                        tool_args = json.loads(tc_item["function"]["arguments"])
+                    except Exception:
+                        tool_args = {}
 
-            if should_hangup:
-                # Rozlúčkový turn — len ak GPT ešte nepovedal rozlúčku v assistant_content
-                if not assistant_content:
-                    stream2 = azure_client.chat.completions.create(
-                        model=AZURE_OPENAI_DEPLOYMENT,
-                        messages=messages,
-                        stream=True,
-                    )
-                    farewell, _ = await _collect_gpt(stream2)
-                    if farewell:
-                        await _tts_to_twilio(farewell, twilio_ws, stream_sid)
-                await asyncio.sleep(4)
-                await twilio_ws.close()
-                return messages
+                    print(f"[v2/tool_call] name={tool_name} args={tool_args}")
+                    result_str = await handle_tool_call(tool_name, tool_args, phone_number, transcript_lines)
 
-            # Pokračuj v slučke (GPT dostane výsledky toolov)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_item["id"],
+                        "content": result_str,
+                    })
+
+                    if tool_name == "ukonci_hovor":
+                        should_hangup = True
+
+                if should_hangup:
+                    # Rozlúčkový turn — len ak GPT ešte nepovedal rozlúčku v assistant_content
+                    if not assistant_content:
+                        stream2 = azure_client.chat.completions.create(
+                            model=AZURE_OPENAI_DEPLOYMENT,
+                            messages=messages,
+                            stream=True,
+                        )
+                        farewell, _ = await _collect_gpt(stream2)
+                        if farewell:
+                            await _tts_to_twilio(farewell, twilio_ws, stream_sid)
+                    await asyncio.sleep(4)
+                    await twilio_ws.close()
+                    return messages
+
+                # Pokračuj v slučke (GPT dostane výsledky toolov)
+
+    except Exception as e:
+        import traceback
+        print(f"[v2/gpt_tts] CHYBA: {e}")
+        traceback.print_exc()
+        return messages
 
 
 @app.websocket("/ws/voice-v2")
@@ -1023,10 +1033,19 @@ async def ws_voice_v2(websocket: WebSocket):
                     )
                     print(f"[ws/voice-v2] stream started sid={stream_sid} phone={phone_number}")
 
-                    # Pozdravný turn — agent začína hovor
-                    asyncio.ensure_future(
-                        _gpt_stream_and_tts(messages, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
-                    )
+                    # Okamžitý pozdrav priamo cez Google TTS — bez GPT cold start
+                    GREETING = "Dobrý deň, Pizzeria Sicilia, akú pizzu si želáte?"
+                    try:
+                        await _tts_to_twilio(GREETING, websocket, stream_sid)
+                        messages.append({"role": "assistant", "content": GREETING})
+                        transcript_lines.append(f"Agent: {GREETING}")
+                        print("[ws/voice-v2] pozdrav odoslaný")
+                    except Exception as e:
+                        print(f"[ws/voice-v2] chyba pozdrav TTS: {e}")
+                        # Fallback: nechaj GPT vygenerovať pozdrav
+                        asyncio.ensure_future(
+                            _gpt_stream_and_tts(messages, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
+                        )
 
                 elif event == "media":
                     mulaw_bytes = base64.b64decode(msg["media"]["payload"])
@@ -1094,9 +1113,14 @@ async def ws_voice_v2(websocket: WebSocket):
                     transcript_lines.append(f"Zákazník: {full_transcript}")
                     messages.append({"role": "user", "content": full_transcript})
 
-                    asyncio.ensure_future(
-                        _gpt_stream_and_tts(messages, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
-                    )
+                    async def _run_gpt():
+                        try:
+                            await _gpt_stream_and_tts(messages, websocket, stream_sid, phone_number, transcript_lines, gpt_lock)
+                        except Exception as e:
+                            import traceback
+                            print(f"[v2/gpt_tts] ensure_future chyba: {e}")
+                            traceback.print_exc()
+                    asyncio.ensure_future(_run_gpt())
 
         await asyncio.gather(
             twilio_to_deepgram(),
