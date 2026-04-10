@@ -355,11 +355,11 @@ async def twilio_voice_webhook(request: Request):
     """
     Twilio voice webhook — vyberá pipeline podľa PIPELINE_VERSION env premennej.
     'azure'  → /ws/voice  (Azure Voice Live)
-    'custom' → /ws/voice-v2 (Deepgram + GPT-4.1 + ElevenLabs)
+    'custom' → /ws/voice-v2 (Deepgram + GPT-4.1 + Google TTS)
     """
     host = request.headers.get("host", "")
 
-    if PIPELINE_VERSION == "custom" and DEEPGRAM_API_KEY and AZURE_OPENAI_KEY and ELEVENLABS_API_KEY:
+    if PIPELINE_VERSION == "custom" and DEEPGRAM_API_KEY and AZURE_OPENAI_KEY and GOOGLE_TTS_API_KEY:
         ws_endpoint = f"wss://{host}/ws/voice-v2"
         twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
