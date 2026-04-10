@@ -542,20 +542,13 @@ async def ws_voice_gemini(websocket: WebSocket):
         client = genai.Client(api_key=GOOGLE_API_KEY)
 
         # Konfigurácia Gemini Live session
-        config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction=types.Content(
-                parts=[types.Part(text=system_instructions)]
-            ),
-            tools=_build_gemini_tools(),
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Kore"  # Gemini Live voice
-                    )
-                )
-            ),
-        )
+        config = {
+            "generation_config": {
+                "response_modalities": ["AUDIO"]
+            },
+            "system_instruction": system_instructions,
+            "tools": _build_gemini_tools(),
+        }
 
         print(f"[ws/voice-gemini] Pripájam sa na Gemini Live API model={GEMINI_MODEL}")
         gemini_session = await client.aio.live.connect(model=GEMINI_MODEL, config=config).__aenter__()
