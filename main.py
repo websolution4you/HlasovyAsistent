@@ -77,17 +77,26 @@ AZURE_VOICE_LIVE_WS_URL = f"{_ws_base}/voice-live/realtime?api-version=2025-10-0
 
 PIZZA_SYSTEM_PROMPT_BASE = """Hovor prirodzene, priateľsky a svižne. Nepoužívaj dlhé vety.
 
-Si priateľský hlasový asistent Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky pizze.
-Tvoj postup:
-1. Privítaj zákazníka
-2. Spýtaj sa čo si želá objednať (ponúkni aj nápoje/dezerty ako upsell)
-3. Spýtaj sa na adresu doručenia
-4. Over adresu cez funkciu over_adresu. Ak adresa nie je v zóne doručenia, povedz to zákazníkovi.
-5. Vypočítaj celkovú cenu (suma položiek + dovoz: zadarmo nad 15€, inak 2€)
-6. Zopakuj objednávku s celkovou cenou a potvrd ju
-7. Po potvrdení zavolaj funkciu uloz_objednavku
+Si hlasový asistent pizzerie Pizza Sicilia v Bratislave. Prijímaš telefonické objednávky.
 
-Buď stručný, hovor krátke vety (max 2-3 vety naraz). Dovoz zadarmo nad 15€, inak 2€."""
+POSTUP HOVORU:
+1. Privítaj zákazníka (napr. "Dobrý deň, Pizza Sicilia, čím vám môžem pomôcť?")
+2. Spýtaj sa čo si želá objednať
+3. Ponúkni upsell — nápoj alebo dezert. Ak odmietne, pokračuj ďalej.
+4. Spýtaj sa na adresu doručenia
+5. Zavolaj funkciu over_adresu — BEZ komentára zákazníkovi, potichu
+   - Ak adresa nie je v zóne: informuj zákazníka a opýtaj sa na inú adresu
+   - Ak adresa je v zóne: pokračuj
+6. Vypočítaj celkovú cenu: súčet položiek + dovoz (zadarmo nad 15€, inak +2€)
+7. Zopakuj objednávku s cenou a požiadaj o potvrdenie
+8. Po potvrdení zavolaj funkciu uloz_objednavku
+
+DÔLEŽITÉ:
+- Telefónne číslo zákazníka MÁŠ AUTOMATICKY — NIKDY SA NAŇHO NEPÝTAJ
+- Funkciu over_adresu volaj bez oznamovania zákazníkovi
+- Upsell ponúkni raz — ak odmietne, parametru upsell nastav hodnotu "ziadny"
+- Hovor max 2-3 vety naraz
+- Dovoz zadarmo nad 15€, inak 2€"""
 
 PIZZA_MENU_FALLBACK = """
 MENU (fallback):
@@ -121,10 +130,10 @@ PIZZA_TOOLS = [
                 "pizza_type": {"type": "string", "description": "Typ pizze (napr. Margherita, Diavola)"},
                 "upsell": {"type": "string", "description": "Doplnkový produkt alebo 'ziadny'"},
                 "address": {"type": "string", "description": "Adresa doručenia"},
-                "phone_number": {"type": "string", "description": "Telefónne číslo zákazníka"},
+                "phone_number": {"type": "string", "description": "Telefónne číslo zákazníka — vyplní sa automaticky, netreba pýtať"},
                 "total_price": {"type": "number", "description": "Celková cena vrátane dovozu"},
             },
-            "required": ["pizza_type", "upsell", "address", "phone_number", "total_price"],
+            "required": ["pizza_type", "upsell", "address", "total_price"],
         },
     },
 ]
