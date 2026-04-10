@@ -72,8 +72,8 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM").strip()
 PIPELINE_VERSION = os.getenv("PIPELINE_VERSION", "azure").strip()  # "azure" alebo "custom"
 
-DEEPGRAM_KEYTERMS = [
-    "Margherita", "Hawaii", "Salami", "Quattro%20Formaggi", "Bresaola",
+DEEPGRAM_KEYWORDS = [
+    "Margherita", "Hawaii", "Salami", "Quattro+Formaggi", "Bresaola",
     "Prosciutto", "Panchetta", "Gorgonzola", "Pepperoni", "Carbonara",
     "Ventricina", "Mortadella", "Pistacio", "Cola", "Kofola", "pizza", "pizzu",
 ]
@@ -775,18 +775,19 @@ PIZZA_TOOLS_OPENAI = [
 
 
 def _build_deepgram_url() -> str:
-    keyterms_qs = "&".join(f"keyterm={k}" for k in DEEPGRAM_KEYTERMS)
+    keywords_qs = "&".join(f"keywords={k}:2" for k in DEEPGRAM_KEYWORDS)
     return (
         f"wss://api.deepgram.com/v1/listen"
         f"?model=nova-3"
         f"&language=sk"
         f"&encoding=mulaw"
         f"&sample_rate=8000"
+        f"&channels=1"
         f"&punctuate=true"
         f"&interim_results=false"
         f"&endpointing=300"
         f"&utterance_end_ms=1500"
-        f"&{keyterms_qs}"
+        f"&{keywords_qs}"
     )
 
 
@@ -967,12 +968,22 @@ async def ws_voice_v2(websocket: WebSocket):
     try:
         # --- Otvoriť Deepgram WebSocket ---
         dg_url = _build_deepgram_url()
-        print(f"[ws/voice-v2] Pripájam Deepgram: {dg_url.split('?')[0]}")
-        deepgram_ws = await websockets.connect(
-            dg_url,
-            additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
-            max_size=10 * 1024 * 1024,
-        )
+        dg_url_log = dg_url  # API kľúč nie je v URL, je v headeri
+        print(f"[ws/voice-v2] Pripájam Deepgram: {dg_url_log}")
+        try:
+            deepgram_ws = await websockets.connect(
+                dg_url,
+                additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+                max_size=10 * 1024 * 1024,
+            )
+        except websockets.exceptions.InvalidStatus as e:
+            print(f"[ws/voice-v2] Deepgram HTTP {e.response.status_code}: {e.response.headers}")
+            try:
+                body = await e.response.read()
+                print(f"[ws/voice-v2] Deepgram response body: {body.decode(errors='replace')}")
+            except Exception:
+                pass
+            raise
         print("[ws/voice-v2] Deepgram pripojený")
 
         # --- Otvoriť ElevenLabs WebSocket ---
