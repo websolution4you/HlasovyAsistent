@@ -74,7 +74,7 @@ TENANT_ID = os.getenv("TENANT_ID", "").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 GOOGLE_TTS_API_KEY = os.getenv("GOOGLE_TTS_API_KEY", "").strip()
 GOOGLE_TTS_VOICE = os.getenv("GOOGLE_TTS_VOICE", "sk-SK-Wavenet-A").strip()
-PIPELINE_VERSION = os.getenv("PIPELINE_VERSION", "azure").strip()  # "azure" alebo "custom"
+PIPELINE_VERSION = os.getenv("PIPELINE_VERSION", "gemini").strip()  # "gemini", "azure" alebo "custom"
 
 DEEPGRAM_KEYWORDS = [
     "Margherita", "Hawaii", "Salami", "Quattro+Formaggi", "Bresaola",
