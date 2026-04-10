@@ -862,8 +862,13 @@ async def _gpt_stream_and_tts(
                     text = delta.content
                     assistant_text_chunks.append(text)
                     chunk_buffer += text
-                    # Flush po ~5 slovách alebo 50 znakoch — menej trhané ako 2 slová
-                    if len(chunk_buffer.split()) >= 5 or len(chunk_buffer) >= 50:
+                    # Flush na interpunkciu (prirodzený boundary)
+                    if any(chunk_buffer.rstrip().endswith(p) for p in [".", ",", "?", "!", ":", ";", "—", "€"]):
+                        if chunk_buffer.strip():
+                            await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
+                            chunk_buffer = ""
+                    # Safety flush ak buffer je veľmi dlhý (bez interpunkcie) — ale len na hranici slova
+                    elif len(chunk_buffer) > 120 and chunk_buffer.endswith(" "):
                         await el_ws.send(json.dumps({"text": chunk_buffer, "flush": True}))
                         chunk_buffer = ""
 
