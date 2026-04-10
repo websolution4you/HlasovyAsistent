@@ -96,9 +96,9 @@ PIZZA_TOOLS = [
         "parameters": {
             "type": "object",
             "properties": {
-                "address": {"type": "string", "description": "Adresa doručenia na overenie"},
+                "query": {"type": "string", "description": "Iba názov ulice BEZ čísla domu"},
             },
-            "required": ["address"],
+            "required": ["query"],
         },
     },
     {
@@ -466,6 +466,7 @@ def build_azure_session_config(phone_number: str = "") -> dict:
             "input_audio_transcription": {
                 "model": "azure-speech",
                 "language": "sk-SK",
+                "phrase_list": "Margherita, Hawaii, Salami, Quattro Formaggi, Bresaola, Prosciutto Parmigiano, Panchetta Gorgonzola, Pepperoni, Milano Napoli, Ventricina, Carbonara, Mortadella, Pistacio, pizza, pizzu, objednávka, adresa, ulica, Cola, Kofola, Levoča, doručenie, číslo",
             },
             "input_audio_noise_reduction": {
                 "type": "azure_deep_noise_suppression"
@@ -504,7 +505,7 @@ def build_azure_session_config(phone_number: str = "") -> dict:
 async def handle_tool_call(tool_name: str, tool_args: dict, phone_number: str, transcript_lines: list = []) -> str:
     """Vykoná tool call od Azure agenta."""
     if tool_name == "over_adresu":
-        raw_address = tool_args.get("address", "")
+        raw_address = tool_args.get("query", tool_args.get("address", ""))
         matched_address, confidence = match_street(raw_address, TENANT_ID)
         if confidence > 0:
             print(f"[tool] over_adresu OK: '{raw_address}' -> '{matched_address}'")
