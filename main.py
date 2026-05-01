@@ -272,7 +272,7 @@ def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
         address = raw_address.strip()
         parts = address.rsplit(maxsplit=1)
 
-        # Kandidáti na street_part + house_number:
+        # Kandidáti na street_part + house_numbto er:
         # 1. Posledné slovo je číslica (napr. "Dlhá 5")
         # 2. Posledné slovo nie je číslica ale adresa má viac slov (napr. "Dlhá tri")
         # 3. Celá adresa je len jeden výraz (napr. "Rozvoj")
@@ -333,47 +333,78 @@ def health_config():
 
 @app.api_route("/twilio/incoming", methods=["GET", "POST"])
 @app.api_route("/twilio/voice", methods=["GET", "POST"])
-async def twilio_voice_webhook():
+async def twilio_voice_webhook(request: Request):
     """
-    Hlavny vstupny bod kazdeho hovoru — Render tu riadi vsetko.
-    1. Skontroluje systemy (DB, ElevenLabs konfig)
-    2. Ak nieco nesedi -> TwiML ospravedlnenie + Hangup (kod, nie prompt)
-    3. Ak vsetko OK -> Redirect na ElevenLabs Twilio endpoint
+    Hlavny vstupny bod kazdeho hovoru — Render riadi hovor cez ElevenLabs register_call.
+    1. Twilio zavola Render /twilio/voice
+    2. Render skontroluje DB + ElevenLabs konfiguraciu
+    3. Render nacita menu z DB a posle ho ako dynamic variable do ElevenLabs
+    4. ElevenLabs vrati hotove TwiML pre Twilio Media Stream
+    5. Render vrati toto TwiML priamo Twiliu
     """
-    # 1. KONTROLA SYSTÉMOV
-    ok, reason = await _check_systems()
-    if not ok:
-        print(f"[twilio/voice] Systemy nedostupne: {reason}")
+    def unavailable_twiml() -> str:
         audio_url = os.getenv("AUDIO_LINKA_NEDOSTUPNA", "").strip()
         if audio_url:
-            twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+            return f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>{xml_escape(audio_url, quote=False)}</Play>
     <Hangup/>
 </Response>'''
-        else:
-            twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+        return '''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say>Dobry den, lutujeme, nasa objednavkova linka je momentalne nedostupna. Skuste prosim zavolat o chvilu neskor. Prajeme pekny den.</Say>
     <Pause length="1"/>
     <Hangup/>
 </Response>'''
+
+    # 1. KONTROLA SYSTÉMOV
+    ok, reason = await _check_systems()
+    if not ok:
+        print(f"[twilio/voice] Systemy nedostupne: {reason}")
+        return Response(content=unavailable_twiml(), media_type="application/xml")
+
+    # 2. TWILIO FORM DATA
+    try:
+        form_data = await request.form()
+        from_number = str(form_data.get("From") or "")
+        to_number = str(form_data.get("To") or "")
+        call_sid = str(form_data.get("CallSid") or "")
+        print(f"[twilio/voice] Inbound call: from={from_number}, to={to_number}, call_sid={call_sid}")
+    except Exception as e:
+        print(f"[twilio/voice] Chyba pri citani Twilio form data: {e}")
+        from_number = ""
+        to_number = ""
+        call_sid = ""
+
+    # 3. MENU Z DB -> DYNAMIC VARIABLE
+    menu = format_menu_from_db(TENANT_ID)
+    if not menu:
+        menu = "Menu momentalne nie je dostupne."
+    print(f"[twilio/voice] Menu nacitane, dlzka={len(menu)} znakov")
+
+    # 4. ELEVENLABS REGISTER CALL -> HOTOVE TWIML PRE TWILIO
+    try:
+        from elevenlabs import ElevenLabs
+
+        client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+        twiml = client.conversational_ai.twilio.register_call(
+            agent_id=ELEVENLABS_AGENT_ID,
+            from_number=from_number,
+            to_number=to_number,
+            direction="inbound",
+            conversation_initiation_client_data={
+                "dynamic_variables": {
+                    "menu": menu,
+                    "caller_number": from_number,
+                    "call_sid": call_sid,
+                }
+            },
+        )
+        print("[twilio/voice] ElevenLabs register_call OK, vraciam TwiML Twiliu")
         return Response(content=twiml, media_type="application/xml")
-
-    # 2. REDIRECT NA ELEVENLABS
-    # ElevenLabs Twilio endpoint — spravuje hovor natyvne (spravny protokol)
-    # Mozno prepisat cez env ELEVENLABS_TWILIO_WEBHOOK_URL
-    elevenlabs_url = os.getenv("ELEVENLABS_TWILIO_WEBHOOK_URL", "").strip()
-    if not elevenlabs_url:
-        elevenlabs_url = f"https://api.elevenlabs.io/v1/convai/twilio/inbound_call?agent_id={ELEVENLABS_AGENT_ID}"
-
-    print(f"[twilio/voice] Systemy OK, redirect na ElevenLabs")
-    safe_url = xml_escape(elevenlabs_url, quote=True)
-    twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Redirect method="POST">{safe_url}</Redirect>
-</Response>'''
-    return Response(content=twiml, media_type="application/xml")
+    except Exception as e:
+        print(f"[twilio/voice] ElevenLabs register_call zlyhal: {e}")
+        return Response(content=unavailable_twiml(), media_type="application/xml")
 
 
 @app.api_route("/twilio/fallback", methods=["GET", "POST"])
