@@ -263,6 +263,7 @@ def health_config():
     }
 
 
+@app.api_route("/twilio/incoming", methods=["GET", "POST"])
 @app.api_route("/twilio/voice", methods=["GET", "POST"])
 async def twilio_voice_webhook():
     """
