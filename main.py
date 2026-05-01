@@ -1,6 +1,7 @@
 import os
 import time
 import unicodedata
+from html import escape as xml_escape
 from rapidfuzz import fuzz, process
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -270,10 +271,13 @@ async def twilio_voice_webhook():
     Zakladny Twilio voice webhook pre prichadzajuce hovory.
     Zatial vracia jednoduche TwiML, aby cislo smerovalo na tento projekt.
     """
-    message = os.getenv("TWILIO_VOICE_MESSAGE", DEFAULT_TWILIO_VOICE_MESSAGE).strip()
+        message = os.getenv("TWILIO_VOICE_MESSAGE", DEFAULT_TWILIO_VOICE_MESSAGE).strip()
+    if not message:
+        message = DEFAULT_TWILIO_VOICE_MESSAGE
+    safe_message = xml_escape(message, quote=False)
     twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Vlasta" language="sk-SK">{message}</Say>
+    <Say>{safe_message}</Say>
     <Pause length="1"/>
     <Hangup/>
 </Response>'''
@@ -287,7 +291,7 @@ async def twilio_fallback_webhook():
     """
     twiml = '''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Vlasta" language="sk-SK">Ospravedlnujeme sa, linka je docasne nedostupna. Skuste prosim zavolat neskor.</Say>
+    <Say>Ospravedlnujeme sa, linka je docasne nedostupna. Skuste prosim zavolat neskor.</Say>
     <Hangup/>
 </Response>'''
     return Response(content=twiml, media_type="application/xml")
