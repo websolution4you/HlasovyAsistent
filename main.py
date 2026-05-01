@@ -271,7 +271,7 @@ async def twilio_voice_webhook():
     Zakladny Twilio voice webhook pre prichadzajuce hovory.
     Zatial vracia jednoduche TwiML, aby cislo smerovalo na tento projekt.
     """
-        message = os.getenv("TWILIO_VOICE_MESSAGE", DEFAULT_TWILIO_VOICE_MESSAGE).strip()
+    message = os.getenv("TWILIO_VOICE_MESSAGE", DEFAULT_TWILIO_VOICE_MESSAGE).strip()
     if not message:
         message = DEFAULT_TWILIO_VOICE_MESSAGE
     safe_message = xml_escape(message, quote=False)
