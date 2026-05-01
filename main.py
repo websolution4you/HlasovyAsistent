@@ -14,6 +14,10 @@ from dotenv import load_dotenv
 # Nacitanie environment premennych (uzitocne pre lokalny vyvoj)
 load_dotenv()
 
+# --- ELEVENLABS KONFIGURÁCIA ---
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "").strip()
+
 app = FastAPI(title="ElevenLabs Pizza Webhook")
 
 
@@ -69,6 +73,8 @@ print(f"PORT: {os.getenv('PORT', 'nenastaveny')}")
 print(f"CORE_SUPABASE_URL nastavene: {'ano' if bool(SUPABASE_URL) else 'nie'}")
 print(f"CORE_SUPABASE_SERVICE_ROLE_KEY nastavene: {'ano' if bool(SUPABASE_KEY) else 'nie'}")
 print(f"TENANT_ID nastavene: {'ano' if bool(TENANT_ID) else 'nie'}")
+print(f"ELEVENLABS_API_KEY nastavene: {'ano' if bool(ELEVENLABS_API_KEY) else 'nie'}")
+print(f"ELEVENLABS_AGENT_ID nastavene: {'ano' if bool(ELEVENLABS_AGENT_ID) else 'nie'}")
 print(f"CORS_ALLOW_ORIGINS: {CORS_ALLOW_ORIGINS}")
 print("----------------------")
 
@@ -192,6 +198,72 @@ def format_menu_from_db(tenant_id: str) -> str:
         return ""
 
 
+async def _check_systems() -> tuple[bool, str]:
+    """
+    Skontroluje ci su vsetky systemy dostupne pred spustenim hovoru.
+    Vracia (ok: bool, reason: str).
+    """
+    print("[check_systems] Kontrola systemov...")
+    print(f"[check_systems] supabase ready: {supabase is not None}")
+    print(f"[check_systems] ELEVENLABS_API_KEY nastaveny: {bool(ELEVENLABS_API_KEY)}")
+    print(f"[check_systems] ELEVENLABS_AGENT_ID nastaveny: {bool(ELEVENLABS_AGENT_ID)}")
+
+    if not supabase:
+        print("[check_systems] FAIL: Supabase klient nie je inicializovany")
+        return False, "Supabase klient nie je inicializovany"
+    try:
+        supabase.table("menu_items").select("name").limit(1).execute()
+        print("[check_systems] DB: OK")
+    except Exception as e:
+        print(f"[check_systems] FAIL: Databaza nedostupna: {e}")
+        return False, f"Databaza nedostupna: {e}"
+    if not ELEVENLABS_API_KEY:
+        print("[check_systems] FAIL: ELEVENLABS_API_KEY chyba")
+        return False, "Chyba ELEVENLABS_API_KEY"
+    if not ELEVENLABS_AGENT_ID:
+        print("[check_systems] FAIL: ELEVENLABS_AGENT_ID chyba")
+        return False, "Chyba ELEVENLABS_AGENT_ID"
+    print("[check_systems] Vsetko OK")
+    return True, "OK"
+
+
+async def _get_elevenlabs_signed_url(menu: str) -> Optional[str]:
+    """
+    Ziska podpisanu WebSocket URL od ElevenLabs s aktualnym menu.
+    Tato URL sa pouzije v TwiML <Stream> — prepoji Twilio priamo s ElevenLabs agentom.
+    """
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.elevenlabs.io/v1/convai/conversation/get_signed_url",
+                headers={"xi-api-key": ELEVENLABS_API_KEY},
+                json={
+                    "agent_id": ELEVENLABS_AGENT_ID,
+                    "conversation_config_override": {
+                        "agent": {
+                            "prompt": {
+                                "variables": {
+                                    "menu": menu
+                                }
+                            }
+                        }
+                    }
+                },
+                timeout=8.0,
+            )
+        if resp.status_code == 200:
+            signed_url = resp.json().get("signed_url")
+            print("[elevenlabs] Signed URL ziskana OK")
+            return signed_url
+        else:
+            print(f"[elevenlabs] Signed URL chyba: {resp.status_code} {resp.text}")
+            return None
+    except Exception as e:
+        print(f"[elevenlabs] Signed URL exception: {e}")
+        return None
+
+
 def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
     """Fuzzy match adresy voči tabuľke ulíc. Vracia (matched_address, confidence 0-1).
     Podporuje čísla ako cifry aj slová (napr. 'Dlhá tri', 'Levočská dvanásť').
@@ -273,19 +345,49 @@ def health_config():
 @app.api_route("/twilio/voice", methods=["GET", "POST"])
 async def twilio_voice_webhook():
     """
-    Zakladny Twilio voice webhook pre prichadzajuce hovory.
-    Zatial vracia jednoduche TwiML, aby cislo smerovalo na tento projekt.
+    Hlavny vstupny bod kazdeho hovoru — Render tu riadi vsetko.
+    1. Skontroluje systemy (DB, ElevenLabs konfig)
+    2. Ak nieco nesedi -> TwiML ospravedlnenie + Hangup (riesene kodom, nie promptom)
+    3. Ak vsetko OK -> nacita menu -> ziska ElevenLabs signed URL -> TwiML Stream
     """
-    message = os.getenv("TWILIO_VOICE_MESSAGE", DEFAULT_TWILIO_VOICE_MESSAGE).strip()
-    if not message:
-        message = DEFAULT_TWILIO_VOICE_MESSAGE
-    safe_message = xml_escape(message, quote=False)
-    twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    # 1. KONTROLA SYSTÉMOV
+    ok, reason = await _check_systems()
+    if not ok:
+        print(f"[twilio/voice] Systemy nedostupne: {reason}")
+        twiml = '''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say>{safe_message}</Say>
+    <Say language="sk-SK">Dobry den, lutujeme, nasa objednavkova linka je momentalne nedostupna. Skuste prosim zavolat o chvilu neskor. Prajeme pekny den.</Say>
     <Pause length="1"/>
     <Hangup/>
 </Response>'''
+        return Response(content=twiml, media_type="application/xml")
+
+    # 2. NAČÍTANIE MENU
+    menu = format_menu_from_db(TENANT_ID)
+    if not menu:
+        menu = "Menu momentalne nie je dostupne."
+
+    # 3. ZÍSKANIE ELEVENLABS SIGNED URL (obsahuje menu ako dynamic variable)
+    signed_url = await _get_elevenlabs_signed_url(menu)
+    if not signed_url:
+        print("[twilio/voice] ElevenLabs signed URL zlyhala")
+        twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="sk-SK">Dobry den, lutujeme, nastala technicka chyba. Skuste prosim zavolat o chvilu neskor.</Say>
+    <Pause length="1"/>
+    <Hangup/>
+</Response>'''
+        return Response(content=twiml, media_type="application/xml")
+
+    # 4. PREPOJENIE TWILIO <-> ELEVENLABS
+    safe_url = xml_escape(signed_url, quote=True)
+    twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{safe_url}"/>
+    </Connect>
+</Response>'''
+    print("[twilio/voice] Hovor prepojeny na ElevenLabs OK")
     return Response(content=twiml, media_type="application/xml")
 
 
@@ -419,6 +521,44 @@ async def vytvor_objednavku(request: Request):
         error_msg = str(e)
         print(f"DEBUG CHYBA: {error_msg}")
         raise HTTPException(status_code=500, detail=f"Chyba Supabase: {error_msg}")
+
+
+@app.post("/api/end_call")
+async def end_call(request: Request):
+    """
+    ElevenLabs end_call tool endpoint.
+    1. Vracia end_call: true — ElevenLabs signal na fyzicke ukoncenie hovoru.
+    2. Ak je k dispozicii CallSid, zaves hovor aj priamo cez Twilio API.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    call_sid = body.get("call_sid") or body.get("CallSid") or body.get("conversation_id")
+    print(f"[end_call] hovor ukonceny, call_sid={call_sid}, payload={body}")
+
+    # Pokus o zavesenie priamo cez Twilio API (ak mame CallSid a credentials)
+    twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+
+    if call_sid and twilio_account_sid and twilio_auth_token:
+        try:
+            import httpx
+            twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_account_sid}/Calls/{call_sid}.json"
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    twilio_url,
+                    data={"Status": "completed"},
+                    auth=(twilio_account_sid, twilio_auth_token),
+                    timeout=5.0,
+                )
+            print(f"[end_call] Twilio hangup: {resp.status_code}")
+        except Exception as e:
+            print(f"[end_call] Twilio hangup chyba (nekriticka): {e}")
+
+    # ElevenLabs signal — toto je hlavny mechanizmus ukoncenia
+    return {"end_call": True}
 
 
 if __name__ == "__main__":
