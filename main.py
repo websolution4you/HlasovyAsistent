@@ -337,15 +337,15 @@ async def twilio_voice_webhook():
     """
     Hlavny vstupny bod kazdeho hovoru — Render tu riadi vsetko.
     1. Skontroluje systemy (DB, ElevenLabs konfig)
-    2. Ak nieco nesedi -> TwiML ospravedlnenie + Hangup (riesene kodom, nie promptom)
-    3. Ak vsetko OK -> nacita menu -> ziska ElevenLabs signed URL -> TwiML Stream
+    2. Ak nieco nesedi -> TwiML ospravedlnenie + Hangup (kod, nie prompt)
+    3. Ak vsetko OK -> Redirect na ElevenLabs Twilio endpoint
     """
-        # 1. KONTROLA SYSTÉMOV
+    # 1. KONTROLA SYSTÉMOV
     ok, reason = await _check_systems()
     if not ok:
         print(f"[twilio/voice] Systemy nedostupne: {reason}")
         audio_url = os.getenv("AUDIO_LINKA_NEDOSTUPNA", "").strip()
-                if audio_url:
+        if audio_url:
             twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>{xml_escape(audio_url, quote=False)}</Play>
@@ -360,40 +360,19 @@ async def twilio_voice_webhook():
 </Response>'''
         return Response(content=twiml, media_type="application/xml")
 
-    # 2. NAČÍTANIE MENU
-    menu = format_menu_from_db(TENANT_ID)
-    if not menu:
-        menu = "Menu momentalne nie je dostupne."
+    # 2. REDIRECT NA ELEVENLABS
+    # ElevenLabs Twilio endpoint — spravuje hovor natyvne (spravny protokol)
+    # Mozno prepisat cez env ELEVENLABS_TWILIO_WEBHOOK_URL
+    elevenlabs_url = os.getenv("ELEVENLABS_TWILIO_WEBHOOK_URL", "").strip()
+    if not elevenlabs_url:
+        elevenlabs_url = f"https://api.elevenlabs.io/v1/convai/twilio/inbound_call?agent_id={ELEVENLABS_AGENT_ID}"
 
-    # 3. ZÍSKANIE ELEVENLABS SIGNED URL (obsahuje menu ako dynamic variable)
-    signed_url = await _get_elevenlabs_signed_url(menu)
-    if not signed_url:
-        print("[twilio/voice] ElevenLabs signed URL zlyhala")
-        audio_url = os.getenv("AUDIO_LINKA_NEDOSTUPNA", "").strip()
-        if audio_url:
-            twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Play>{xml_escape(audio_url, quote=False)}</Play>
-    <Hangup/>
-</Response>'''
-        else:
-            twiml = '''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say>Dobry den, lutujeme, nastala technicka chyba. Skuste prosim zavolat o chvilu neskor.</Say>
-    <Pause length="1"/>
-    <Hangup/>
-</Response>'''
-        return Response(content=twiml, media_type="application/xml")
-
-    # 4. PREPOJENIE TWILIO <-> ELEVENLABS
-    safe_url = xml_escape(signed_url, quote=True)
+    print(f"[twilio/voice] Systemy OK, redirect na ElevenLabs")
+    safe_url = xml_escape(elevenlabs_url, quote=True)
     twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Connect>
-        <Stream url="{safe_url}"/>
-    </Connect>
+    <Redirect method="POST">{safe_url}</Redirect>
 </Response>'''
-    print("[twilio/voice] Hovor prepojeny na ElevenLabs OK")
     return Response(content=twiml, media_type="application/xml")
 
 
