@@ -229,27 +229,17 @@ async def _check_systems() -> tuple[bool, str]:
 
 async def _get_elevenlabs_signed_url(menu: str) -> Optional[str]:
     """
-    Ziska podpisanu WebSocket URL od ElevenLabs s aktualnym menu.
+    Ziska podpisanu WebSocket URL od ElevenLabs.
     Tato URL sa pouzije v TwiML <Stream> — prepoji Twilio priamo s ElevenLabs agentom.
+    Menu sa doruci cez /api/prompt-config ktore ElevenLabs vola samostatne.
     """
     try:
         import httpx
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
+            resp = await client.get(
                 "https://api.elevenlabs.io/v1/convai/conversation/get_signed_url",
                 headers={"xi-api-key": ELEVENLABS_API_KEY},
-                json={
-                    "agent_id": ELEVENLABS_AGENT_ID,
-                    "conversation_config_override": {
-                        "agent": {
-                            "prompt": {
-                                "variables": {
-                                    "menu": menu
-                                }
-                            }
-                        }
-                    }
-                },
+                params={"agent_id": ELEVENLABS_AGENT_ID},
                 timeout=8.0,
             )
         if resp.status_code == 200:
