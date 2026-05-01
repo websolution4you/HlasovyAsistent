@@ -345,7 +345,7 @@ async def twilio_voice_webhook():
     if not ok:
         print(f"[twilio/voice] Systemy nedostupne: {reason}")
         audio_url = os.getenv("AUDIO_LINKA_NEDOSTUPNA", "").strip()
-        if audio_url:
+                if audio_url:
             twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>{xml_escape(audio_url, quote=False)}</Play>
@@ -354,7 +354,7 @@ async def twilio_voice_webhook():
         else:
             twiml = '''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say language="sk-SK">Dobry den, lutujeme, nasa objednavkova linka je momentalne nedostupna. Skuste prosim zavolat o chvilu neskor. Prajeme pekny den.</Say>
+    <Say>Dobry den, lutujeme, nasa objednavkova linka je momentalne nedostupna. Skuste prosim zavolat o chvilu neskor. Prajeme pekny den.</Say>
     <Pause length="1"/>
     <Hangup/>
 </Response>'''
@@ -379,7 +379,7 @@ async def twilio_voice_webhook():
         else:
             twiml = '''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say language="sk-SK">Dobry den, lutujeme, nastala technicka chyba. Skuste prosim zavolat o chvilu neskor.</Say>
+    <Say>Dobry den, lutujeme, nastala technicka chyba. Skuste prosim zavolat o chvilu neskor.</Say>
     <Pause length="1"/>
     <Hangup/>
 </Response>'''
