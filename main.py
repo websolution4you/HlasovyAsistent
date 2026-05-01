@@ -350,11 +350,19 @@ async def twilio_voice_webhook():
     2. Ak nieco nesedi -> TwiML ospravedlnenie + Hangup (riesene kodom, nie promptom)
     3. Ak vsetko OK -> nacita menu -> ziska ElevenLabs signed URL -> TwiML Stream
     """
-    # 1. KONTROLA SYSTÉMOV
+        # 1. KONTROLA SYSTÉMOV
     ok, reason = await _check_systems()
     if not ok:
         print(f"[twilio/voice] Systemy nedostupne: {reason}")
-        twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+        audio_url = os.getenv("AUDIO_LINKA_NEDOSTUPNA", "").strip()
+        if audio_url:
+            twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Play>{xml_escape(audio_url, quote=False)}</Play>
+    <Hangup/>
+</Response>'''
+        else:
+            twiml = '''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="sk-SK">Dobry den, lutujeme, nasa objednavkova linka je momentalne nedostupna. Skuste prosim zavolat o chvilu neskor. Prajeme pekny den.</Say>
     <Pause length="1"/>
@@ -371,7 +379,15 @@ async def twilio_voice_webhook():
     signed_url = await _get_elevenlabs_signed_url(menu)
     if not signed_url:
         print("[twilio/voice] ElevenLabs signed URL zlyhala")
-        twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+        audio_url = os.getenv("AUDIO_LINKA_NEDOSTUPNA", "").strip()
+        if audio_url:
+            twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Play>{xml_escape(audio_url, quote=False)}</Play>
+    <Hangup/>
+</Response>'''
+        else:
+            twiml = '''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="sk-SK">Dobry den, lutujeme, nastala technicka chyba. Skuste prosim zavolat o chvilu neskor.</Say>
     <Pause length="1"/>
