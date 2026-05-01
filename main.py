@@ -113,11 +113,16 @@ def _normalize(s: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
-def _street_score(query: str, street: str) -> int:
-    """Vráti skóre 0–100 (max z ratio a partial_ratio cez rapidfuzz)."""
+def _street_score(query: str, street: str) -> tuple[int, int]:
+    """Vráti (primary_score, ratio) — primary uprednostňuje presnejšiu/kratšiu zhodu.
+    partial_ratio je penalizovaný 0.85x, aby kratší presný match vyhral nad substrinom.
+    """
     q = _normalize(query)
     s = _normalize(street)
-    return round(max(fuzz.ratio(q, s), fuzz.partial_ratio(q, s)))
+    r = fuzz.ratio(q, s)
+    pr = fuzz.partial_ratio(q, s)
+    primary = round(max(r, pr * 0.85))
+    return primary, r
 
 
 def _get_streets_cached(tenant_id: str) -> list[str]:
@@ -325,39 +330,39 @@ async def prompt_config():
 @app.post("/api/search-street")
 async def search_street(body: SearchStreetRequest):
     """
-    Fuzzy vyhľadávanie ulice podľa časti názvu (STT výstup z ElevenLabs).
-    Cachuje ulice z DB na 5 minút. Vracia max 2 zhody so skóre ≥ 55.
+    Fuzzy vyhladavanie ulice podla casti nazvu (STT vystup z ElevenLabs).
+    Cachuje ulice z DB na 5 minut. Vracia max 2 zhody so skore >= 55.
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
 
     query = body.query.strip()
     if not query:
-        raise HTTPException(status_code=422, detail="Parameter query nesmie byť prázdny.")
+        raise HTTPException(status_code=422, detail="Parameter query nesmie byt prazdny.")
 
     try:
         streets = _get_streets_cached(TENANT_ID)
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Chyba pri načítaní ulíc: {e}")
+        raise HTTPException(status_code=500, detail=f"Chyba pri nacitani ulic: {e}")
 
     if not streets:
-        return {"found": False, "message": "Na túto adresu momentálne nevieme doručiť.", "suggestions": []}
+        return {"found": False, "message": "Na tuto adresu momentalne nevieme dorucit.", "suggestions": []}
 
     print(f"[search-street] query='{query}' streets_count={len(streets)}")
 
-    scored = sorted(
-        ({"street": s, "score": _street_score(query, s)} for s in streets),
-        key=lambda x: x["score"],
-        reverse=True,
-    )
-    top = [item for item in scored[:2] if item["score"] >= 55]
+    results = []
+    for s in streets:
+        primary, ratio = _street_score(query, s)
+        results.append({"street": s, "score": primary, "ratio": ratio})
+    results.sort(key=lambda x: (x["score"], x["ratio"]), reverse=True)
+    top = [{"street": item["street"], "score": item["score"]} for item in results[:2] if item["score"] >= 55]
 
     print(f"[search-street] top_results={top}")
 
     if not top:
-        return {"found": False, "message": "Na túto adresu momentálne nevieme doručiť.", "suggestions": []}
+        return {"found": False, "message": "Na tuto adresu momentalne nevieme dorucit.", "suggestions": []}
 
     return {
         "found": True,
