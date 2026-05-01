@@ -295,6 +295,7 @@ def health():
     return {"status": "ok", "engine": "gemma4"}
 
 
+@app.api_route("/twilio/incoming", methods=["GET", "POST"])
 @app.api_route("/twilio/voice", methods=["GET", "POST"])
 async def twilio_voice_webhook(request: Request):
     """Twilio voice webhook — smeruje na Gemma 4 endpoint."""
