@@ -520,7 +520,7 @@ async def vytvor_objednavku(request: Request):
         print(f"[vytvor-objednavku] validacna chyba: {e}")
         raise HTTPException(status_code=422, detail=str(e))
 
-            try:
+    try:
         matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
 
         order_data = {
@@ -538,7 +538,15 @@ async def vytvor_objednavku(request: Request):
         }
 
         # Najdi existujuci zaznam vytvoreny pri starte hovoru (status=CALLING)
-        existing = supabase.table("pizza_orders").select("id").eq("tenant_id", TENANT_ID).eq("status", "CALLING").order("created_at", desc=True).limit(1).execute()
+        existing = (
+            supabase.table("pizza_orders")
+            .select("id")
+            .eq("tenant_id", TENANT_ID)
+            .eq("status", "CALLING")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
 
         if existing.data:
             record_id = existing.data[0]["id"]
