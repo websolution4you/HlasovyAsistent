@@ -3,7 +3,7 @@ import time
 import unicodedata
 from html import escape as xml_escape
 from rapidfuzz import fuzz, process
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -490,8 +490,85 @@ async def search_street(body: SearchStreetRequest):
     }
 
 
+async def send_whatsapp_message(to: str, body: str) -> bool:
+    """Odosle WhatsApp spravu cez Twilio REST API"""
+    twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+
+    if not twilio_account_sid or not twilio_auth_token:
+        print("Twilio credentials missing. Cannot send WhatsApp messages.")
+        return False
+
+    TWILIO_WHATSAPP_NUMBER = '+420910922442'
+    
+    from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
+    to_number = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
+
+    try:
+        import httpx
+        twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_account_sid}/Messages.json"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                twilio_url,
+                data={
+                    "Body": body,
+                    "From": from_number,
+                    "To": to_number
+                },
+                auth=(twilio_account_sid, twilio_auth_token),
+                timeout=10.0,
+            )
+        if resp.status_code in (200, 201):
+            print(f"[whatsapp] Message sent successfully to {to_number}")
+            return True
+        else:
+            print(f"[whatsapp] Failed to send message to {to_number}: {resp.status_code} {resp.text}")
+            return False
+    except Exception as e:
+        print(f"[whatsapp] Exception while sending message to {to_number}: {e}")
+        return False
+
+async def send_order_notifications_task(order_data: dict):
+    """Bezi na pozadi a posle notifikacie do pizzerie aj zakaznikovi."""
+    import asyncio
+    
+    restaurant_phone = os.getenv("RESTAURANT_PHONE", "+421910922442") # Zmenit na realne cislo pizzerie
+    customer_phone = order_data.get("customer_phone", "")
+    delivery_address = order_data.get("delivery_address", "")
+    pizza_type = order_data.get("pizza_type", "")
+    total_price = order_data.get("total_price", 0.0)
+    
+    # Sprava pre restauraciu
+    restaurant_body = (
+        "🍕 *NOVÁ OBJEDNÁVKA PIZZE*\n\n"
+        f"📞 *Zákazník:* {customer_phone}\n"
+        f"📍 *Adresa doručenia:* {delivery_address}\n\n"
+        f"🛒 *Objednávka:*\n"
+        f"{pizza_type}\n\n"
+        f"💰 *Spolu:* {total_price:.2f} €"
+    )
+    
+    # Sprava pre zakaznika
+    customer_body = (
+        "🍕 *Ďakujeme za Vašu objednávku z PapiZoo!*\n\n"
+        f"Vaša objednávka sa pripravuje.\n"
+        f"🛒 *Objednávka:*\n{pizza_type}\n"
+        f"📍 *Bude doručená na adresu:* {delivery_address}\n"
+        f"💰 *Suma k úhrade:* {total_price:.2f} €.\n\n"
+        "Dobrú chuť! 😊"
+    )
+    
+    tasks = []
+    if restaurant_phone:
+        tasks.append(send_whatsapp_message(restaurant_phone, restaurant_body))
+    if customer_phone:
+        tasks.append(send_whatsapp_message(customer_phone, customer_body))
+        
+    if tasks:
+        await asyncio.gather(*tasks)
+
 @app.post("/api/vytvor-objednavku")
-async def vytvor_objednavku(request: Request):
+async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks):
     """
     Endpoint pre ElevenLabs agenta (manage_order tool) na ulozenie objednavky do DB.
     """
@@ -527,6 +604,9 @@ async def vytvor_objednavku(request: Request):
         }
 
         supabase.table("pizza_orders").insert(order_data).execute()
+
+        # Spustenie notifikacii na pozadi (neblokuje agenta)
+        background_tasks.add_task(send_order_notifications_task, order_data)
 
         return {
             "status": "success",
