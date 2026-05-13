@@ -592,12 +592,13 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
         supabase.table("pizza_orders").insert(order_data).execute()
         print(f"[vytvor-objednavku] INSERT pizza_orders OK")
 
-        # Planovanie notifikacie na pozadi
-        background_tasks.add_task(send_order_notifications_task, order_data)
+        # OKAMZITA NOTIFIKACIA (uz nie na pozadi, aby to bolo hned)
+        await send_order_notifications_task(order_data)
 
-        error_msg = str(e)
-        print(f"DEBUG CHYBA: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"Chyba Supabase: {error_msg}")
+        return {"status": "success", "message": "Objednavka uspesne zapisana."}
+    except Exception as e:
+        print(f"[vytvor-objednavku] CHYBA: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/end_call")
