@@ -364,8 +364,8 @@ async def twilio_voice_webhook(request: Request):
         """TwiML pre overovacie hovory (nahra kód)."""
         return '''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say>Hello. Recording starts now.</Say>
-    <Record maxLength="30" playBeep="true" />
+    <Record maxLength="60" playBeep="false" trim="trim-silence" />
+    <Hangup/>
 </Response>'''
 
     # 1. KONTROLA SYSTÉMOV
