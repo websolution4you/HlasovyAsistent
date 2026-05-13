@@ -3,7 +3,7 @@ import time
 import unicodedata
 from html import escape as xml_escape
 from rapidfuzz import fuzz, process
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -99,6 +99,7 @@ class ManageOrder(BaseModel):
     upsell_item: Optional[str] = None
     upsell_accepted: bool = False
     transcript: Optional[str] = None
+    call_sid: Optional[str] = None
 
 
 ALLERGEN_MAP = {
@@ -497,8 +498,85 @@ async def search_street(body: SearchStreetRequest):
     }
 
 
+async def send_whatsapp_message(to: str, body: str) -> bool:
+    """Odosle WhatsApp spravu cez Twilio REST API"""
+    twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+
+    if not twilio_account_sid or not twilio_auth_token:
+        print("Twilio credentials missing. Cannot send WhatsApp messages.")
+        return False
+
+    TWILIO_WHATSAPP_NUMBER = '+420910922442'
+    
+    from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
+    to_number = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
+
+    try:
+        import httpx
+        twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_account_sid}/Messages.json"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                twilio_url,
+                data={
+                    "Body": body,
+                    "From": from_number,
+                    "To": to_number
+                },
+                auth=(twilio_account_sid, twilio_auth_token),
+                timeout=10.0,
+            )
+        if resp.status_code in (200, 201):
+            print(f"[whatsapp] Message sent successfully to {to_number}")
+            return True
+        else:
+            print(f"[whatsapp] Failed to send message to {to_number}: {resp.status_code} {resp.text}")
+            return False
+    except Exception as e:
+        print(f"[whatsapp] Exception while sending message to {to_number}: {e}")
+        return False
+
+async def send_order_notifications_task(order_data: dict):
+    """Bezi na pozadi a posle notifikacie do pizzerie aj zakaznikovi."""
+    import asyncio
+    
+    restaurant_phone = os.getenv("RESTAURANT_PHONE", "+421910922442") # Zmenit na realne cislo pizzerie
+    customer_phone = order_data.get("customer_phone", "")
+    delivery_address = order_data.get("delivery_address", "")
+    pizza_type = order_data.get("pizza_type", "")
+    total_price = order_data.get("total_price", 0.0)
+    
+    # Sprava pre restauraciu
+    restaurant_body = (
+        "🍕 *NOVÁ OBJEDNÁVKA PIZZE*\n\n"
+        f"📞 *Zákazník:* {customer_phone}\n"
+        f"📍 *Adresa doručenia:* {delivery_address}\n\n"
+        f"🛒 *Objednávka:*\n"
+        f"{pizza_type}\n\n"
+        f"💰 *Spolu:* {total_price:.2f} €"
+    )
+    
+    # Sprava pre zakaznika
+    customer_body = (
+        "🍕 *Ďakujeme za Vašu objednávku z PapiZoo!*\n\n"
+        f"Vaša objednávka sa pripravuje.\n"
+        f"🛒 *Objednávka:*\n{pizza_type}\n"
+        f"📍 *Bude doručená na adresu:* {delivery_address}\n"
+        f"💰 *Suma k úhrade:* {total_price:.2f} €.\n\n"
+        "Dobrú chuť! 😊"
+    )
+    
+    tasks = []
+    if restaurant_phone:
+        tasks.append(send_whatsapp_message(restaurant_phone, restaurant_body))
+    if customer_phone:
+        tasks.append(send_whatsapp_message(customer_phone, customer_body))
+        
+    if tasks:
+        await asyncio.gather(*tasks)
+
 @app.post("/api/vytvor-objednavku")
-async def vytvor_objednavku(request: Request):
+async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks):
     """
     Endpoint pre ElevenLabs agenta (manage_order tool) na ulozenie objednavky do DB.
     """
@@ -515,12 +593,20 @@ async def vytvor_objednavku(request: Request):
     try:
         matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
 
-        real_phone = _LAST_CALLER_PHONE or order.customer_phone or ""
-        print(f"[vytvor-objednavku] customer_phone={real_phone}, raw_customer_phone={order.customer_phone}")
+        # Skusime ziskat skutocne cislo volajuceho z tabulky 'calls' podla call_sid
+        customer_phone = order.customer_phone or _LAST_CALLER_PHONE or ""
+        if order.call_sid:
+            try:
+                res = supabase.table("calls").select("from_number").eq("provider_call_id", order.call_sid).execute()
+                if res.data and res.data[0].get("from_number"):
+                    customer_phone = res.data[0]["from_number"]
+                    print(f"[vytvor-objednavku] Pouzivam cislo z tabulky calls: {customer_phone}")
+            except Exception as e:
+                print(f"[vytvor-objednavku] Chyba pri hladani v tabulke calls: {e}")
 
         order_data = {
             "tenant_id": TENANT_ID,
-            "customer_phone": real_phone,
+            "customer_phone": customer_phone,
             "phone_raw": order.customer_phone or "",
             "customer_name": order.customer_name or "Zákazník",
             "pizza_type": order.pizza_type,
@@ -536,7 +622,21 @@ async def vytvor_objednavku(request: Request):
         }
 
         supabase.table("pizza_orders").insert(order_data).execute()
-        print(f"[vytvor-objednavku] INSERT pizza_orders OK, customer_phone={real_phone}")
+        print(f"[vytvor-objednavku] INSERT pizza_orders OK, customer_phone={customer_phone}")
+
+        # Spustenie notifikacii na pozadi (neblokuje agenta)
+        # Posielame WA zakaznikovi len ak ide o realne tel. cislo (zacina +)
+        if customer_phone and customer_phone.startswith("+"):
+            background_tasks.add_task(send_order_notifications_task, order_data)
+        else:
+            # Ak je to webovy hovor, posleme notifikaciu aspon restauracii
+            print(f"[vytvor-objednavku] Webovy hovor ({customer_phone}), posielam WA len restauracii.")
+            background_tasks.add_task(send_whatsapp_message, os.getenv("RESTAURANT_PHONE", "+421910922442"), (
+                "🍕 *NOVÁ OBJEDNÁVKA (WEB)*\n\n"
+                f"📍 *Adresa:* {matched_address}\n"
+                f"🛒 *Objednávka:* {order.pizza_type}\n"
+                f"💰 *Suma:* {order.total_price:.2f} €"
+            ))
 
         return {
             "status": "success",
