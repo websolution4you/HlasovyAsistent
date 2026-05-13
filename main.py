@@ -99,6 +99,7 @@ class ManageOrder(BaseModel):
     upsell_item: Optional[str] = None
     upsell_accepted: bool = False
     transcript: Optional[str] = None
+    call_sid: Optional[str] = None
 
 
 ALLERGEN_MAP = {
@@ -592,12 +593,20 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
     try:
         matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
 
-        real_phone = _LAST_CALLER_PHONE or order.customer_phone or ""
-        print(f"[vytvor-objednavku] customer_phone={real_phone}, raw_customer_phone={order.customer_phone}")
+        # Skusime ziskat skutocne cislo volajuceho z tabulky 'calls' podla call_sid
+        customer_phone = order.customer_phone or _LAST_CALLER_PHONE or ""
+        if order.call_sid:
+            try:
+                res = supabase.table("calls").select("from_number").eq("provider_call_id", order.call_sid).execute()
+                if res.data and res.data[0].get("from_number"):
+                    customer_phone = res.data[0]["from_number"]
+                    print(f"[vytvor-objednavku] Pouzivam cislo z tabulky calls: {customer_phone}")
+            except Exception as e:
+                print(f"[vytvor-objednavku] Chyba pri hladani v tabulke calls: {e}")
 
         order_data = {
             "tenant_id": TENANT_ID,
-            "customer_phone": real_phone,
+            "customer_phone": customer_phone,
             "phone_raw": order.customer_phone or "",
             "customer_name": order.customer_name or "Zákazník",
             "pizza_type": order.pizza_type,
@@ -613,10 +622,21 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
         }
 
         supabase.table("pizza_orders").insert(order_data).execute()
-        print(f"[vytvor-objednavku] INSERT pizza_orders OK, customer_phone={real_phone}")
+        print(f"[vytvor-objednavku] INSERT pizza_orders OK, customer_phone={customer_phone}")
 
         # Spustenie notifikacii na pozadi (neblokuje agenta)
-        background_tasks.add_task(send_order_notifications_task, order_data)
+        # Posielame WA zakaznikovi len ak ide o realne tel. cislo (zacina +)
+        if customer_phone and customer_phone.startswith("+"):
+            background_tasks.add_task(send_order_notifications_task, order_data)
+        else:
+            # Ak je to webovy hovor, posleme notifikaciu aspon restauracii
+            print(f"[vytvor-objednavku] Webovy hovor ({customer_phone}), posielam WA len restauracii.")
+            background_tasks.add_task(send_whatsapp_message, os.getenv("RESTAURANT_PHONE", "+421910922442"), (
+                "🍕 *NOVÁ OBJEDNÁVKA (WEB)*\n\n"
+                f"📍 *Adresa:* {matched_address}\n"
+                f"🛒 *Objednávka:* {order.pizza_type}\n"
+                f"💰 *Suma:* {order.total_price:.2f} €"
+            ))
 
         return {
             "status": "success",
