@@ -372,16 +372,15 @@ async def twilio_voice_webhook(request: Request):
         to_number = str(form_data.get("To") or "")
         call_sid = str(form_data.get("CallSid") or "")
         print(f"[twilio/voice] Inbound call: from={from_number}, to={to_number}, call_sid={call_sid}")
-        # Hned ulozime zaznam do pizza_orders so spravnym cislom volajuceho
+                # Hned ulozime zaznam do pizza_orders so spravnym cislom volajuceho
         if call_sid and from_number and supabase:
             try:
                 supabase.table("pizza_orders").insert({
                     "tenant_id": TENANT_ID,
-                    "call_id": call_sid,
                     "customer_phone": from_number,
                     "status": "CALLING",
                 }).execute()
-                print(f"[twilio/voice] pizza_orders pre-insert OK: {call_sid} -> {from_number}")
+                print(f"[twilio/voice] pizza_orders pre-insert OK: {from_number}")
             except Exception as db_err:
                 print(f"[twilio/voice] pizza_orders pre-insert chyba (nekriticka): {db_err}")
     except Exception as e:
