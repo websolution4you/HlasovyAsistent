@@ -373,7 +373,8 @@ async def twilio_voice_webhook(request: Request):
         to_number = str(form_data.get("To") or "")
         call_sid = str(form_data.get("CallSid") or "")
         print(f"[twilio/voice] Inbound call: from={from_number}, to={to_number}, call_sid={call_sid}")
-        if from_number:            
+        if from_number:
+            global _LAST_CALLER_PHONE
             _LAST_CALLER_PHONE = from_number
             print(f"[twilio/voice] _LAST_CALLER_PHONE={from_number}")
     except Exception as e:
@@ -529,7 +530,9 @@ async def send_order_notifications_task(order_data: dict):
     
     tasks = []
     if restaurant_phone: tasks.append(send_whatsapp_message(restaurant_phone, res_body))
-    if customer_phone and customer_phone.startswith("+"): tasks.append(send_whatsapp_message(customer_phone, cus_body))
+    # Posielame WA len ak mame skutocne cislo (musi zacinat +)
+    if customer_phone and customer_phone.startswith("+"): 
+        tasks.append(send_whatsapp_message(customer_phone, cus_body))
     if tasks: await asyncio.gather(*tasks)
 
 
