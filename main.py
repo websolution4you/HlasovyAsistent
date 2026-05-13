@@ -113,6 +113,8 @@ _STREETS_CACHE: dict = {"data": [], "tenant_id": "", "timestamp": 0.0}
 _CACHE_TTL = 300  # 5 minút
 
 
+
+
 def _normalize(s: str) -> str:
     """Lowercase + odstránenie diakritiky."""
     nfkd = unicodedata.normalize("NFD", s.lower().strip())
@@ -369,12 +371,24 @@ async def twilio_voice_webhook(request: Request):
         from_number = str(form_data.get("From") or "")
         to_number = str(form_data.get("To") or "")
         call_sid = str(form_data.get("CallSid") or "")
-        print(f"[twilio/voice] Inbound call: from={from_number}, to={to_number}, call_sid={call_sid}")
+                print(f"[twilio/voice] Inbound call: from={from_number}, to={to_number}, call_sid={call_sid}")
+                # Hned ulozime zaznam do pizza_orders so spravnym cislom volajuceho
+                if call_sid and from_number and supabase:
+                    try:
+                        supabase.table("pizza_orders").insert({
+                            "tenant_id": TENANT_ID,
+                            "call_id": call_sid,
+                            "customer_phone": from_number,
+                            "status": "CALLING",
+                        }).execute()
+                        print(f"[twilio/voice] pizza_orders pre-insert OK: {call_sid} -> {from_number}")
+                    except Exception as db_err:
+                        print(f"[twilio/voice] pizza_orders pre-insert chyba (nekriticka): {db_err}")
     except Exception as e:
-        print(f"[twilio/voice] Chyba pri citani Twilio form data: {e}")
-        from_number = ""
-        to_number = ""
-        call_sid = ""
+                print(f"[twilio/voice] Chyba pri citani Twilio form data: {e}")
+                from_number = ""
+                to_number = ""
+                call_sid = ""
 
     # 3. MENU Z DB -> DYNAMIC VARIABLE
     menu = format_menu_from_db(TENANT_ID)
@@ -506,27 +520,35 @@ async def vytvor_objednavku(request: Request):
         print(f"[vytvor-objednavku] validacna chyba: {e}")
         raise HTTPException(status_code=422, detail=str(e))
 
-    try:
+        try:
         matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
 
-        order_data = {
-            "tenant_id": TENANT_ID,
-            "customer_phone": order.customer_phone or "",
-            "phone_raw": order.customer_phone or "",
-            "customer_name": order.customer_name or "Zákazník",
-            "pizza_type": order.pizza_type,
-            "total_price": order.total_price,
-            "delivery_address": matched_address,
-            "address_raw": order.delivery_address,
-            "address_confidence": confidence,
-            "upsell_offered": order.upsell_item is not None,
-            "upsell_item": order.upsell_item,
-            "upsell_accepted": order.upsell_accepted,
-            "notes": order.transcript,
-            "status": "NEW",
-        }
+                order_data = {
+                    "customer_name": order.customer_name or "Zákazník",
+                    "pizza_type": order.pizza_type,
+                    "total_price": order.total_price,
+                    "delivery_address": matched_address,
+                    "address_raw": order.delivery_address,
+                    "address_confidence": confidence,
+                    "upsell_offered": order.upsell_item is not None,
+                    "upsell_item": order.upsell_item,
+                    "upsell_accepted": order.upsell_accepted,
+                    "notes": order.transcript,
+                    "status": "NEW",
+                }
 
-        supabase.table("pizza_orders").insert(order_data).execute()
+                # Najdi existujuci zaznam vytvoreny pri starte hovoru (status=CALLING)
+                existing = supabase.table("pizza_orders").select("id").eq("tenant_id", TENANT_ID).eq("status", "CALLING").order("created_at", desc=True).limit(1).execute()
+
+                if existing.data:
+                    record_id = existing.data[0]["id"]
+                    supabase.table("pizza_orders").update(order_data).eq("id", record_id).execute()
+                    print(f"[vytvor-objednavku] UPDATE pizza_orders id={record_id} OK")
+                else:
+                    # Fallback: zaznam z twilio/voice neexistuje, vytvor novy
+                    order_data["tenant_id"] = TENANT_ID
+                    supabase.table("pizza_orders").insert(order_data).execute()
+                    print("[vytvor-objednavku] INSERT pizza_orders (fallback) OK")
 
         return {
             "status": "success",
