@@ -500,30 +500,39 @@ async def search_street(body: SearchStreetRequest):
 
 # --- WHATSAPP LOGIKA (DOPLNOK) ---
 
-async def send_whatsapp_message(to: str, body: str) -> bool:
+async def send_whatsapp_message(to: str, message: str) -> bool:
     """Odosle WhatsApp spravu cez Twilio REST API"""
     twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
     twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
     if not twilio_account_sid or not twilio_auth_token:
+        print("[whatsapp] CHYBA: Chybaju Twilio credentials")
         return False
+        
+    print(f"[whatsapp] DEBUG: Using SID={twilio_account_sid[:5]}... Token={twilio_auth_token[:5]}...")
+    
     TWILIO_WHATSAPP_NUMBER = '+420910922442'
     from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
     to_number = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
     print(f"[whatsapp] DEBUG: Sending from '{from_number}' to '{to_number}'")
+    
     try:
         import httpx
         twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_account_sid}/Messages.json"
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                twilio_url, 
-                data={"Body": body, "From": from_number, "To": to_number}, 
-                auth=(twilio_account_sid, twilio_auth_token), 
+                twilio_url,
+                data={
+                    "From": from_number,
+                    "To": to_number,
+                    "Body": message
+                },
+                auth=(twilio_account_sid, twilio_auth_token),
                 timeout=10.0
             )
         print(f"[whatsapp] Twilio response: {resp.status_code} - {resp.text}")
-        return resp.status_code in (200, 201)
+        return resp.status_code in [200, 201]
     except Exception as e:
-        print(f"[whatsapp] Exception: {e}")
+        print(f"[whatsapp] CHYBA: {e}")
         return False
 
 async def send_order_notifications_task(order_data: dict):
@@ -556,54 +565,36 @@ async def send_order_notifications_task(order_data: dict):
 @app.post("/api/vytvor-objednavku")
 async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks):
     """
-    Endpoint pre ElevenLabs agenta (manage_order tool) na ulozenie objednavky do DB.
+    ElevenLabs tool endpoint pre vytvorenie objednavky.
+    Zapisuje do Supabase a planuje WhatsApp notifikacie.
     """
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
     try:
         body = await request.json()
         print(f"[vytvor-objednavku] raw body: {body}")
-        order = ManageOrder(**body)
-    except Exception as e:
-        print(f"[vytvor-objednavku] validacna chyaba: {e}")
-        raise HTTPException(status_code=422, detail=str(e))
 
-    try:
-        matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
+        # Ziskanie cisla zakaznika (prednostne z globalnej premennej)
+        global _LAST_CALLER_PHONE
+        real_phone = _LAST_CALLER_PHONE if _LAST_CALLER_PHONE else body.get("customer_phone")
+        print(f"[vytvor-objednavku] customer_phone={_LAST_CALLER_PHONE}, raw_customer_phone={body.get('customer_phone')}")
 
-        # POVODNA LOGIKA TVOJHO KOLEGU (commit fc570e6)
-        real_phone = _LAST_CALLER_PHONE or order.customer_phone or ""
-        print(f"[vytvor-objednavku] customer_phone={real_phone}, raw_customer_phone={order.customer_phone}")
-
+        order = PizzaOrder(**body)
         order_data = {
             "tenant_id": TENANT_ID,
             "customer_phone": real_phone,
-            "phone_raw": order.customer_phone or "",
-            "customer_name": order.customer_name or "Zákazník",
+            "delivery_address": order.delivery_address,
             "pizza_type": order.pizza_type,
-            "total_price": order.total_price,
-            "delivery_address": matched_address,
-            "address_raw": order.delivery_address,
-            "address_confidence": confidence,
-            "upsell_offered": order.upsell_item is not None,
-            "upsell_item": order.upsell_item,
+            "total_price": float(order.total_price),
             "upsell_accepted": order.upsell_accepted,
             "notes": order.transcript,
             "status": "NEW",
         }
 
         supabase.table("pizza_orders").insert(order_data).execute()
-        print(f"[vytvor-objednavku] INSERT pizza_orders OK, customer_phone={real_phone}")
+        print(f"[vytvor-objednavku] INSERT pizza_orders OK")
 
-        # PRIDANA NOTIFIKACIA (ako doplnek, ktory neovplyvni povodny kod)
+        # Planovanie notifikacie na pozadi
         background_tasks.add_task(send_order_notifications_task, order_data)
 
-        return {
-            "status": "success",
-            "message": "Objednavka uspesne zapisana.",
-        }
-
-    except Exception as e:
         error_msg = str(e)
         print(f"DEBUG CHYBA: {error_msg}")
         raise HTTPException(status_code=500, detail=f"Chyba Supabase: {error_msg}")
