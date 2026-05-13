@@ -509,6 +509,7 @@ async def send_whatsapp_message(to: str, body: str) -> bool:
     TWILIO_WHATSAPP_NUMBER = '+420910922442'
     from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
     to_number = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
+    print(f"[whatsapp] DEBUG: Sending from '{from_number}' to '{to_number}'")
     try:
         import httpx
         twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_account_sid}/Messages.json"
