@@ -112,6 +112,9 @@ ALLERGEN_MAP = {
 _STREETS_CACHE: dict = {"data": [], "tenant_id": "", "timestamp": 0.0}
 _CACHE_TTL = 300  # 5 minút
 
+# Cislo posledneho volajuceho — ulozi sa z Twilio From pri kazdom hovore
+_LAST_CALLER_PHONE: str = ""
+
 
 def _normalize(s: str) -> str:
     """Lowercase + odstránenie diakritiky."""
@@ -342,6 +345,7 @@ async def twilio_voice_webhook(request: Request):
     4. ElevenLabs vrati hotove TwiML pre Twilio Media Stream
     5. Render vrati toto TwiML priamo Twiliu
     """
+    global _LAST_CALLER_PHONE
     def unavailable_twiml() -> str:
         audio_url = os.getenv("AUDIO_LINKA_NEDOSTUPNA", "").strip()
         if audio_url:
@@ -370,6 +374,9 @@ async def twilio_voice_webhook(request: Request):
         to_number = str(form_data.get("To") or "")
         call_sid = str(form_data.get("CallSid") or "")
         print(f"[twilio/voice] Inbound call: from={from_number}, to={to_number}, call_sid={call_sid}")
+        if from_number:            
+            _LAST_CALLER_PHONE = from_number
+            print(f"[twilio/voice] _LAST_CALLER_PHONE={from_number}")
     except Exception as e:
         print(f"[twilio/voice] Chyba pri citani Twilio form data: {e}")
         from_number = ""
@@ -574,7 +581,6 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
-
     try:
         body = await request.json()
         print(f"[vytvor-objednavku] raw body: {body}")
@@ -586,9 +592,12 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
     try:
         matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
 
+        real_phone = _LAST_CALLER_PHONE or order.customer_phone or ""
+        print(f"[vytvor-objednavku] customer_phone={real_phone}, raw_customer_phone={order.customer_phone}")
+
         order_data = {
             "tenant_id": TENANT_ID,
-            "customer_phone": order.customer_phone or "",
+            "customer_phone": real_phone,
             "phone_raw": order.customer_phone or "",
             "customer_name": order.customer_name or "Zákazník",
             "pizza_type": order.pizza_type,
@@ -604,6 +613,7 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
         }
 
         supabase.table("pizza_orders").insert(order_data).execute()
+        print(f"[vytvor-objednavku] INSERT pizza_orders OK, customer_phone={real_phone}")
 
         # Spustenie notifikacii na pozadi (neblokuje agenta)
         background_tasks.add_task(send_order_notifications_task, order_data)
