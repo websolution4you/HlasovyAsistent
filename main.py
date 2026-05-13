@@ -360,13 +360,7 @@ async def twilio_voice_webhook(request: Request):
     <Hangup/>
 </Response>'''
 
-    def verification_twiml() -> str:
-        """TwiML pre overovacie hovory (nahra kód)."""
-        return '''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Record maxLength="60" playBeep="false" trim="trim-silence" />
-    <Hangup/>
-</Response>'''
+
 
     # 1. KONTROLA SYSTÉMOV
     ok, reason = await _check_systems()
@@ -385,12 +379,6 @@ async def twilio_voice_webhook(request: Request):
             global _LAST_CALLER_PHONE
             _LAST_CALLER_PHONE = from_number
             print(f"[twilio/voice] _LAST_CALLER_PHONE={from_number}")
-            
-        # DETEKCIA OVEROVACIEHO HOVORU OD METY / WHATSAPP
-        # Meta casto vola z UK cisiel (+44...) alebo USA
-        if from_number.startswith("+44") or from_number.startswith("+1"):
-            print(f"[twilio/voice] Detekovany mozny overovaci hovor z {from_number}. Zapinam nahrávanie.")
-            return Response(content=verification_twiml(), media_type="application/xml")
     except Exception as e:
         print(f"[twilio/voice] Chyba pri citani Twilio form data: {e}")
         from_number = ""
