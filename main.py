@@ -360,6 +360,14 @@ async def twilio_voice_webhook(request: Request):
     <Hangup/>
 </Response>'''
 
+    def verification_twiml() -> str:
+        """TwiML pre overovacie hovory (nahra kód)."""
+        return '''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>Hello. Recording starts now.</Say>
+    <Record maxLength="30" playBeep="true" />
+</Response>'''
+
     # 1. KONTROLA SYSTÉMOV
     ok, reason = await _check_systems()
     if not ok:
@@ -377,6 +385,12 @@ async def twilio_voice_webhook(request: Request):
             global _LAST_CALLER_PHONE
             _LAST_CALLER_PHONE = from_number
             print(f"[twilio/voice] _LAST_CALLER_PHONE={from_number}")
+            
+        # DETEKCIA OVEROVACIEHO HOVORU OD METY / WHATSAPP
+        # Meta casto vola z UK cisiel (+44...) alebo USA
+        if from_number.startswith("+44") or from_number.startswith("+1"):
+            print(f"[twilio/voice] Detekovany mozny overovaci hovor z {from_number}. Zapinam nahrávanie.")
+            return Response(content=verification_twiml(), media_type="application/xml")
     except Exception as e:
         print(f"[twilio/voice] Chyba pri citani Twilio form data: {e}")
         from_number = ""
@@ -511,14 +525,22 @@ async def send_whatsapp_message(to: str, body: str) -> bool:
         import httpx
         twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_account_sid}/Messages.json"
         async with httpx.AsyncClient() as client:
-            await client.post(twilio_url, data={"Body": body, "From": from_number, "To": to_number}, auth=(twilio_account_sid, twilio_auth_token), timeout=10.0)
-        return True
-    except:
+            resp = await client.post(
+                twilio_url, 
+                data={"Body": body, "From": from_number, "To": to_number}, 
+                auth=(twilio_account_sid, twilio_auth_token), 
+                timeout=10.0
+            )
+        print(f"[whatsapp] Twilio response: {resp.status_code} - {resp.text}")
+        return resp.status_code in (200, 201)
+    except Exception as e:
+        print(f"[whatsapp] Exception: {e}")
         return False
 
 async def send_order_notifications_task(order_data: dict):
     """Posle notifikacie na pozadi"""
     import asyncio
+    print(f"[whatsapp] Spustam notifikaciu pre objednavku: {order_data.get('pizza_type')}")
     restaurant_phone = os.getenv("RESTAURANT_PHONE", "+421910922442")
     customer_phone = order_data.get("customer_phone", "")
     pizza_type = order_data.get("pizza_type", "")
@@ -529,11 +551,17 @@ async def send_order_notifications_task(order_data: dict):
     cus_body = f"🍕 *Ďakujeme za objednávku z PapiZoo!*\n\nVaša pizza ({pizza_type}) sa pripravuje.\nDoručíme ju na adresu: {address}.\nSuma: {price:.2f} €.\n\nDobrú chuť! 😊"
     
     tasks = []
-    if restaurant_phone: tasks.append(send_whatsapp_message(restaurant_phone, res_body))
+    if restaurant_phone: 
+        print(f"[whatsapp] Posielam restauracii na {restaurant_phone}")
+        tasks.append(send_whatsapp_message(restaurant_phone, res_body))
     # Posielame WA len ak mame skutocne cislo (musi zacinat +)
     if customer_phone and customer_phone.startswith("+"): 
+        print(f"[whatsapp] Posielam zakaznikovi na {customer_phone}")
         tasks.append(send_whatsapp_message(customer_phone, cus_body))
-    if tasks: await asyncio.gather(*tasks)
+    
+    if tasks: 
+        results = await asyncio.gather(*tasks)
+        print(f"[whatsapp] Vysledky odosielania: {results}")
 
 
 @app.post("/api/vytvor-objednavku")
