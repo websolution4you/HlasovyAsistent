@@ -577,7 +577,7 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
         real_phone = _LAST_CALLER_PHONE if _LAST_CALLER_PHONE else body.get("customer_phone")
         print(f"[vytvor-objednavku] customer_phone={_LAST_CALLER_PHONE}, raw_customer_phone={body.get('customer_phone')}")
 
-        order = PizzaOrder(**body)
+        order = ManageOrder(**body)
         order_data = {
             "tenant_id": TENANT_ID,
             "customer_phone": real_phone,
