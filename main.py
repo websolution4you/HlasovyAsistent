@@ -500,32 +500,44 @@ async def search_street(body: SearchStreetRequest):
 
 # --- WHATSAPP LOGIKA (DOPLNOK) ---
 
-async def send_whatsapp_message(to: str, message: str) -> bool:
-    """Odosle WhatsApp spravu cez Twilio REST API"""
+async def send_whatsapp_message(to: str, message: str, template_sid: str = None, variables: dict = None) -> bool:
+    """Odosle WhatsApp spravu cez Twilio REST API (podporuje free-form aj šablóny)"""
     twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
     twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+    
     if not twilio_account_sid or not twilio_auth_token:
         print("[whatsapp] CHYBA: Chybaju Twilio credentials")
         return False
         
-    print(f"[whatsapp] DEBUG: Using SID={twilio_account_sid[:5]}... Token={twilio_auth_token[:5]}...")
-    
     TWILIO_WHATSAPP_NUMBER = '+420910922442'
     from_number = f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
     to_number = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
-    print(f"[whatsapp] DEBUG: Sending from '{from_number}' to '{to_number}'")
     
     try:
         import httpx
+        import json
         twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_account_sid}/Messages.json"
+        
+        data = {
+            "From": from_number,
+            "To": to_number,
+        }
+        
+        # Ak pouzivame sablonu (produkcia)
+        if template_sid:
+            data["ContentSid"] = template_sid
+            if variables:
+                data["ContentVariables"] = json.dumps(variables)
+            print(f"[whatsapp] Odosielam SABLONU {template_sid} na {to_number}")
+        else:
+            # Free-form sprava (len v ramci 24h okna)
+            data["Body"] = message
+            print(f"[whatsapp] Odosielam BODY na {to_number}")
+
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 twilio_url,
-                data={
-                    "From": from_number,
-                    "To": to_number,
-                    "Body": message
-                },
+                data=data,
                 auth=(twilio_account_sid, twilio_auth_token),
                 timeout=10.0
             )
@@ -535,31 +547,69 @@ async def send_whatsapp_message(to: str, message: str) -> bool:
         print(f"[whatsapp] CHYBA: {e}")
         return False
 
+
+async def send_sms_message(to: str, message: str) -> bool:
+    """Odosle klasicku SMS cez Twilio REST API"""
+    twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+    
+    if not twilio_account_sid or not twilio_auth_token:
+        return False
+        
+    TWILIO_NUMBER = '+420910922442'
+    to_number = to # SMS nepotrebuje predponu whatsapp:
+    
+    try:
+        import httpx
+        twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_account_sid}/Messages.json"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                twilio_url,
+                data={
+                    "From": TWILIO_NUMBER,
+                    "To": to_number,
+                    "Body": message
+                },
+                auth=(twilio_account_sid, twilio_auth_token),
+                timeout=10.0
+            )
+        print(f"[sms] Twilio response: {resp.status_code} - {resp.text}")
+        return resp.status_code in [200, 201]
+    except Exception as e:
+        print(f"[sms] CHYBA: {e}")
+        return False
+
+
 async def send_order_notifications_task(order_data: dict):
-    """Posle notifikacie na pozadi"""
-    import asyncio
-    print(f"[whatsapp] Spustam notifikaciu pre objednavku: {order_data.get('pizza_type')}")
-    restaurant_phone = os.getenv("RESTAURANT_PHONE", "+421910922442")
-    customer_phone = order_data.get("customer_phone", "")
-    pizza_type = order_data.get("pizza_type", "")
-    address = order_data.get("delivery_address", "")
-    price = order_data.get("total_price", 0.0)
+    """Spracuje a odosle notifikacie pre zakaznika (WA+SMS) aj restauraciu (WA)."""
+    # KONFIGURACIA SABLON
+    TPL_CUSTOMER = os.getenv("TWILIO_TPL_CUSTOMER") 
+    TPL_RESTAURANT = os.getenv("TWILIO_TPL_RESTAURANT")
+    RESTAURANT_PHONE = os.getenv("RESTAURANT_PHONE", "+421910922442")
     
-    res_body = f"🍕 *NOVÁ OBJEDNÁVKA*\n\n📞 *Zákazník:* {customer_phone}\n📍 *Adresa:* {address}\n🛒 *Pizza:* {pizza_type}\n💰 *Suma:* {price:.2f} €"
-    cus_body = f"🍕 *Ďakujeme za objednávku z PapiZoo!*\n\nVaša pizza ({pizza_type}) sa pripravuje.\nDoručíme ju na adresu: {address}.\nSuma: {price:.2f} €.\n\nDobrú chuť! 😊"
+    pizza = order_data.get("pizza_type", "Pizza")
+    address = order_data.get("delivery_address", "u nas")
+    price = str(order_data.get("total_price", "0"))
+    phone = order_data.get("customer_phone", "")
+    notes = order_data.get("notes", "-")
+
+    # 1. NOTIFIKACIA PRE RESTAURACIU (WhatsApp)
+    msg_rest = f"✅ *NOVÁ OBJEDNÁVKA* \n\nZákazník: {phone}\nAdresa: {address}\nPizza: {pizza}\nSuma: {price} €"
+    vars_rest = {"1": phone, "2": address, "3": pizza, "4": price, "5": notes}
+    await send_whatsapp_message(RESTAURANT_PHONE, msg_rest, TPL_RESTAURANT, vars_rest)
+
+    # 2. NOTIFIKACIA PRE ZAKAZNIKA (WhatsApp + SMS)
+    if phone and phone.startswith("+"):
+        # WhatsApp
+        msg_cust = f"Dobrý deň! Vaša objednávka z Papizoo ({pizza}) sa pripravuje. Suma: {price} €."
+        vars_cust = {"1": pizza, "2": address, "3": price}
+        await send_whatsapp_message(phone, msg_cust, TPL_CUSTOMER, vars_cust)
+        
+        # SMS
+        sms_body = f"PAPIZOO: Dakujeme za objednavku ({pizza}). Dorucujeme na: {address}. Suma: {price} EUR."
+        await send_sms_message(phone, sms_body)
     
-    tasks = []
-    if restaurant_phone: 
-        print(f"[whatsapp] Posielam restauracii na {restaurant_phone}")
-        tasks.append(send_whatsapp_message(restaurant_phone, res_body))
-    # Posielame WA len ak mame skutocne cislo (musi zacinat +)
-    if customer_phone and customer_phone.startswith("+"): 
-        print(f"[whatsapp] Posielam zakaznikovi na {customer_phone}")
-        tasks.append(send_whatsapp_message(customer_phone, cus_body))
-    
-    if tasks: 
-        results = await asyncio.gather(*tasks)
-        print(f"[whatsapp] Vysledky odosielania: {results}")
+    print(f"[notifikacie] Hotovo.")
 
 
 @app.post("/api/vytvor-objednavku")
