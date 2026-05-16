@@ -7,4 +7,8 @@ python-multipart
 rapidfuzz
 httpx
 elevenlabs
+requests
+twilio
+websockets
+
 
