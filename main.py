@@ -2,7 +2,7 @@ import os
 import time
 import unicodedata
 from html import escape as xml_escape
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -110,6 +110,9 @@ ALLERGEN_MAP = {
 
 
 _STREETS_CACHE: dict = {"data": [], "tenant_id": "", "timestamp": 0.0}
+_STREET_MIN_SCORE = 70
+_STREET_AUTO_ACCEPT_SCORE = 88
+_STREET_AUTO_ACCEPT_MARGIN = 10
 _CACHE_TTL = 300  # 5 minút
 
 # Cislo posledneho volajuceho — ulozi sa z Twilio From pri kazdom hovore
@@ -132,6 +135,64 @@ def _street_score(query: str, street: str) -> tuple[int, int]:
     pr = fuzz.partial_ratio(q, s)
     primary = round(max(r, pr * 0.85))
     return primary, r
+
+
+def _street_query_candidates(raw_address: str) -> list[str]:
+    """Build street-name candidates from an address without trusting the house number."""
+    address = raw_address.strip()
+    if not address:
+        return []
+
+    candidates = []
+    parts = address.rsplit(maxsplit=1)
+    if len(parts) == 2:
+        candidates.append(parts[0])
+    candidates.append(address)
+
+    cleaned = []
+    seen = set()
+    for candidate in candidates:
+        value = candidate.strip(" ,.")
+        key = _normalize(value)
+        if value and key not in seen:
+            cleaned.append(value)
+            seen.add(key)
+    return cleaned
+
+
+def _rank_streets(raw_address: str, streets: list[str]) -> list[dict]:
+    candidates = _street_query_candidates(raw_address)
+    results = []
+    for street in streets:
+        best_score = 0
+        best_ratio = 0
+        for candidate in candidates:
+            primary, ratio = _street_score(candidate, street)
+            if (primary, ratio) > (best_score, best_ratio):
+                best_score = primary
+                best_ratio = ratio
+        results.append({"street": street, "score": best_score, "ratio": best_ratio})
+    results.sort(key=lambda x: (x["score"], x["ratio"]), reverse=True)
+    return results
+
+
+def _street_resolution(raw_address: str, streets: list[str]) -> dict:
+    ranked = _rank_streets(raw_address, streets)
+    top = [item for item in ranked[:2] if item["score"] >= _STREET_MIN_SCORE]
+    best = top[0] if top else None
+    second = top[1] if len(top) > 1 else None
+    margin = best["score"] - second["score"] if best and second else 100
+    auto_accept = bool(
+        best
+        and best["score"] >= _STREET_AUTO_ACCEPT_SCORE
+        and margin >= _STREET_AUTO_ACCEPT_MARGIN
+    )
+    return {
+        "best": best,
+        "suggestions": top,
+        "margin": margin,
+        "auto_accept": auto_accept,
+    }
 
 
 def _get_streets_cached(tenant_id: str) -> list[str]:
@@ -258,9 +319,7 @@ async def _get_elevenlabs_signed_url(menu: str) -> Optional[str]:
 
 
 def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
-    """Fuzzy match adresy voči tabuľke ulíc. Vracia (matched_address, confidence 0-1).
-    Podporuje čísla ako cifry aj slová (napr. 'Dlhá tri', 'Levočská dvanásť').
-    """
+    """Fuzzy match adresy voci tabulke ulic. Vracia (matched_address, confidence 0-100)."""
     if not supabase or not tenant_id:
         return raw_address, 0
 
@@ -269,34 +328,27 @@ def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
         if not result.data:
             return raw_address, 0
 
-        street_names = [s["name"] for s in result.data]
-        street_names_lower = {name.lower(): name for name in street_names}
-
         address = raw_address.strip()
-        parts = address.rsplit(maxsplit=1)
+        street_names = [s["name"] for s in result.data]
+        resolution = _street_resolution(address, street_names)
+        best = resolution["best"]
+        if not best:
+            print(f"Address no match: '{address}'")
+            return raw_address, 0
 
-        # Kandidáti na street_part + house_number:
-        # 1. Posledné slovo je číslica (napr. "Dlhá 5")
-        # 2. Posledné slovo nie je číslica ale adresa má viac slov (napr. "Dlhá tri")
-        # 3. Celá adresa je len jeden výraz (napr. "Rozvoj")
-        candidates = []
-        if len(parts) == 2:
-            candidates.append((parts[0], parts[1]))  # bez posledného slova
-        candidates.append((address, ""))  # celá adresa bez čísla
-
-        for street_part, house_number in candidates:
-            results = process.extractOne(
-                street_part.lower(), street_names_lower.keys(), score_cutoff=60
+        confidence = int(best["score"])
+        if not resolution["auto_accept"]:
+            print(
+                f"Address uncertain: '{address}' -> '{best['street']}' "
+                f"score={confidence} margin={resolution['margin']}"
             )
-            matches = [results[0]] if results else []
-            if matches:
-                matched_name = street_names_lower[matches[0]]
-                matched_address = f"{matched_name} {house_number}".strip() if house_number else matched_name
-                print(f"Address match: '{address}' -> '{matched_address}'")
-                return matched_address, 1
+            return raw_address, confidence
 
-        print(f"Address no match: '{address}'")
-        return raw_address, 0
+        parts = address.rsplit(maxsplit=1)
+        house_number = parts[1] if len(parts) == 2 else ""
+        matched_address = f"{best['street']} {house_number}".strip() if house_number else best["street"]
+        print(f"Address match: '{address}' -> '{matched_address}' score={confidence}")
+        return matched_address, confidence
     except Exception as e:
         print(f"Chyba pri matchovani adresy: {e}")
         return raw_address, 0
@@ -458,7 +510,7 @@ async def prompt_config():
 async def search_street(body: SearchStreetRequest):
     """
     Fuzzy vyhladavanie ulice podla casti nazvu (STT vystup z ElevenLabs).
-    Cachuje ulice z DB na 5 minut. Vracia max 2 zhody so skore >= 55.
+    Vrati found=True iba pri vysokej a jednoznacnej zhode.
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
@@ -479,22 +531,35 @@ async def search_street(body: SearchStreetRequest):
 
     print(f"[search-street] query='{query}' streets_count={len(streets)}")
 
-    results = []
-    for s in streets:
-        primary, ratio = _street_score(query, s)
-        results.append({"street": s, "score": primary, "ratio": ratio})
-    results.sort(key=lambda x: (x["score"], x["ratio"]), reverse=True)
-    top = [{"street": item["street"], "score": item["score"]} for item in results[:2] if item["score"] >= 55]
+    resolution = _street_resolution(query, streets)
+    top = [{"street": item["street"], "score": item["score"]} for item in resolution["suggestions"]]
 
-    print(f"[search-street] top_results={top}")
+    print(f"[search-street] top_results={top} margin={resolution['margin']} auto_accept={resolution['auto_accept']}")
 
     if not top:
-        return {"found": False, "message": "Na tuto adresu momentalne nevieme dorucit.", "suggestions": []}
+        return {
+            "found": False,
+            "needs_confirmation": True,
+            "message": "Nerozumel som presne nazvu ulice. Poproste zakaznika, aby ulicu zopakoval po pismenach alebo povedal blizsi orientacny bod.",
+            "suggestions": [],
+        }
+
+    if not resolution["auto_accept"]:
+        return {
+            "found": False,
+            "needs_confirmation": True,
+            "message": "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu ulicu a vypytajte si jasne ano/nie potvrdenie.",
+            "best_match": top[0]["street"],
+            "confidence": top[0]["score"],
+            "margin": resolution["margin"],
+            "suggestions": top,
+        }
 
     return {
         "found": True,
         "best_match": top[0]["street"],
         "confidence": top[0]["score"],
+        "needs_confirmation": False,
         "suggestions": top,
     }
 
@@ -591,10 +656,31 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
         print(f"[vytvor-objednavku] customer_phone={_LAST_CALLER_PHONE}, raw_customer_phone={body.get('customer_phone')}")
 
         order = ManageOrder(**body)
+    except Exception as e:
+        print(f"[vytvor-objednavku] validacna chyba: {e}")
+        raise HTTPException(status_code=422, detail=str(e))
+
+    try:
+        matched_address, confidence = match_street(order.delivery_address, TENANT_ID)
+        if confidence < _STREET_AUTO_ACCEPT_SCORE:
+            print(
+                f"[vytvor-objednavku] address needs confirmation: "
+                f"raw='{order.delivery_address}' confidence={confidence}"
+            )
+            return {
+                "status": "needs_confirmation",
+                "message": "Adresu sa nepodarilo spolahlivo overit. Objednavku este neuzatvarajte; vypytajte si potvrdenie ulice a cisla domu.",
+                "delivery_address": order.delivery_address,
+                "address_confidence": confidence,
+            }
+
+        real_phone = _LAST_CALLER_PHONE or order.customer_phone or ""
+        print(f"[vytvor-objednavku] customer_phone={real_phone}, raw_customer_phone={order.customer_phone}")
+
         order_data = {
             "tenant_id": TENANT_ID,
             "customer_phone": real_phone,
-            "delivery_address": order.delivery_address,
+            "delivery_address": matched_address,
             "pizza_type": order.pizza_type,
             "total_price": float(order.total_price),
             "upsell_accepted": order.upsell_accepted,
@@ -612,6 +698,9 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
     except Exception as e:
         print(f"[vytvor-objednavku] CHYBA: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
 
 
 @app.post("/api/end_call")
