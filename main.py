@@ -472,14 +472,6 @@ async def twilio_voice_webhook(request: Request):
             _LAST_CALLER_PHONE = customer_number
             if call_sid:
                 CALL_CONTEXT[call_sid] = customer_number
-                # Uloz do Supabase — perzistentne pre Cloud Run
-                try:
-                    supabase.table("call_sessions").upsert(
-                        {"call_sid": call_sid, "caller_phone": customer_number}
-                    ).execute()
-                    print(f"[twilio/voice] call_sessions upsert OK: {call_sid} -> {customer_number}")
-                except Exception as db_err:
-                    print(f"[twilio/voice] call_sessions upsert CHYBA (nekriticka): {db_err}")
             print(f"[twilio/voice] _LAST_CALLER_PHONE={customer_number}, CALL_CONTEXT[{call_sid}]={customer_number if call_sid else ''}")
         elif from_number or caller_number:
             print(f"[twilio/voice] WARNING: no non-Twilio caller resolved, from={from_number}, caller={caller_number}, owned={sorted(_twilio_owned_numbers())}")
@@ -726,56 +718,23 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
                 "address_confidence": confidence,
                         }
 
-        call_sid = str(body.get("call_sid") or body.get("CallSid") or "")
-        conversation_id = str(body.get("conversation_id") or body.get("conversationId") or "")
+                # caller_number poslali sme sami do ElevenLabs z Twilio From — je to spravne cislo volajuceho
+        caller_number = _normalize_phone(body.get("caller_number") or "")
         payload_phone = _normalize_phone(body.get("customer_phone") or order.customer_phone or "")
-        payload_caller_phone = _first_customer_phone_candidate(
-            body.get("caller_number") or "",
-            body.get("from_number") or "",
-            body.get("From") or "",
-            body.get("Caller") or "",
-        )
 
-        # 1. Supabase call_sessions — perzistentne, funguje na vsetkych Cloud Run instanciach
-        real_phone = ""
-        if call_sid:
-            try:
-                res = supabase.table("call_sessions").select("caller_phone").eq("call_sid", call_sid).maybe_single().execute()
-                if res and res.data and res.data.get("caller_phone"):
-                    real_phone = _normalize_phone(res.data["caller_phone"])
-                    print(f"[vytvor-objednavku] phone z call_sessions: call_sid={call_sid} -> {real_phone}")
-            except Exception as db_err:
-                print(f"[vytvor-objednavku] call_sessions lookup CHYBA: {db_err}")
-
-        # 2. In-memory CALL_CONTEXT (fallback ak call_sessions chyba)
-        if not real_phone and call_sid and CALL_CONTEXT.get(call_sid) and not _is_twilio_owned_number(CALL_CONTEXT[call_sid]):
-            real_phone = CALL_CONTEXT[call_sid]
-            print("[vytvor-objednavku] WARNING: phone z in-memory CALL_CONTEXT")
-
-        # 3. Explicitny caller_number z ElevenLabs payloadu
-        if not real_phone and payload_caller_phone:
-            real_phone = payload_caller_phone
-            print("[vytvor-objednavku] WARNING: phone z payload caller_number/from_number")
-
-        # 4. _LAST_CALLER_PHONE (posledny hovor, neistoty)
-        if not real_phone and _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
+        if caller_number and not _is_twilio_owned_number(caller_number):
+            real_phone = caller_number
+        elif _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
             real_phone = _LAST_CALLER_PHONE
-            print("[vytvor-objednavku] WARNING: phone z _LAST_CALLER_PHONE")
-
-        # 5. payload customer_phone ako posledna zachrana
-        if not real_phone and payload_phone and not _is_twilio_owned_number(payload_phone):
+            print("[vytvor-objednavku] WARNING: caller_number chybalo, pouzivam _LAST_CALLER_PHONE")
+        elif payload_phone and not _is_twilio_owned_number(payload_phone):
             real_phone = payload_phone
-            print("[vytvor-objednavku] WARNING: phone z payload customer_phone")
+            print("[vytvor-objednavku] WARNING: pouzivam payload customer_phone")
+        else:
+            real_phone = ""
+            print(f"[vytvor-objednavku] WARNING: ziadne platne cislo; caller_number={caller_number}, payload_phone={payload_phone}")
 
-        if not real_phone:
-            print(f"[vytvor-objednavku] WARNING: ziadne platne cislo; payload_phone={payload_phone}")
-
-        print(
-            "[vytvor-objednavku] phone_resolution "
-            f"call_sid={call_sid}, payload_phone={payload_phone}, "
-            f"payload_caller_phone={payload_caller_phone}, "
-            f"final_customer_phone={real_phone}"
-        )
+        print(f"[vytvor-objednavku] phone_resolution caller_number={caller_number}, _LAST_CALLER_PHONE={_LAST_CALLER_PHONE}, final={real_phone}")
 
         order_data = {
             "tenant_id": TENANT_ID,
