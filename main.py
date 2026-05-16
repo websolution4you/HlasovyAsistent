@@ -121,6 +121,34 @@ _LAST_CALLER_PHONE: str = ""
 # Kontext hovorov: Twilio CallSid / ElevenLabs conversation_id -> Twilio From cislo.
 CALL_CONTEXT: dict[str, str] = {}
 CONVERSATION_CONTEXT: dict[str, str] = {}
+TWILIO_NUMBER_CONTEXT: set[str] = set()
+
+# Zname vlastne Twilio cisla nikdy neukladame ako customer_phone.
+# Dalsie cisla sa daju doplnit cez env TWILIO_OWNED_NUMBERS oddelene ciarkou.
+_DEFAULT_TWILIO_OWNED_NUMBERS = {"+420910922442", "+420910925466"}
+
+
+def _normalize_phone(phone: str) -> str:
+    return str(phone or "").strip().replace(" ", "")
+
+
+def _twilio_owned_numbers() -> set[str]:
+    raw = os.getenv("TWILIO_OWNED_NUMBERS", "").strip()
+    configured = {_normalize_phone(item) for item in raw.split(",") if item.strip()}
+    return {num for num in (_DEFAULT_TWILIO_OWNED_NUMBERS | configured | TWILIO_NUMBER_CONTEXT) if num}
+
+
+def _is_twilio_owned_number(phone: str) -> bool:
+    normalized = _normalize_phone(phone)
+    return bool(normalized and normalized in _twilio_owned_numbers())
+
+
+def _first_customer_phone_candidate(*phones: str) -> str:
+    for phone in phones:
+        normalized = _normalize_phone(phone)
+        if normalized and not _is_twilio_owned_number(normalized):
+            return normalized
+    return ""
 
 
 
@@ -423,23 +451,37 @@ async def twilio_voice_webhook(request: Request):
         print(f"[twilio/voice] Systemy nedostupne: {reason}")
         return Response(content=unavailable_twiml(), media_type="application/xml")
 
-    # 2. TWILIO FORM DATA
+    #TWILIO FORM DATA
     try:
         form_data = await request.form()
-        from_number = str(form_data.get("From") or "")
-        to_number = str(form_data.get("To") or "")
+        twilio_payload = dict(form_data)
+        from_number = _normalize_phone(form_data.get("From") or "")
+        caller_number = _normalize_phone(form_data.get("Caller") or "")
+        to_number = _normalize_phone(form_data.get("To") or "")
+        called_number = _normalize_phone(form_data.get("Called") or "")
         call_sid = str(form_data.get("CallSid") or "")
-        print(f"[twilio/voice] Inbound call: from={from_number}, to={to_number}, call_sid={call_sid}")
-        if from_number:
+        if to_number:
+            TWILIO_NUMBER_CONTEXT.add(to_number)
+        if called_number:
+            TWILIO_NUMBER_CONTEXT.add(called_number)
+        customer_number = _first_customer_phone_candidate(from_number, caller_number)
+        print(f"[twilio/voice] raw Twilio payload: {twilio_payload}")
+        print(f"[twilio/voice] Inbound call: from={from_number}, caller={caller_number}, to={to_number}, called={called_number}, call_sid={call_sid}, resolved_customer={customer_number}")
+        if customer_number:
             global _LAST_CALLER_PHONE
-            _LAST_CALLER_PHONE = from_number
+            _LAST_CALLER_PHONE = customer_number
             if call_sid:
-                CALL_CONTEXT[call_sid] = from_number
-            print(f"[twilio/voice] _LAST_CALLER_PHONE={from_number}, CALL_CONTEXT[{call_sid}]={from_number if call_sid else ''}")
+                CALL_CONTEXT[call_sid] = customer_number
+            print(f"[twilio/voice] _LAST_CALLER_PHONE={customer_number}, CALL_CONTEXT[{call_sid}]={customer_number if call_sid else ''}")
+        elif from_number or caller_number:
+            print(f"[twilio/voice] WARNING: no non-Twilio caller resolved, from={from_number}, caller={caller_number}, owned={sorted(_twilio_owned_numbers())}")
     except Exception as e:
         print(f"[twilio/voice] Chyba pri citani Twilio form data: {e}")
         from_number = ""
+        caller_number = ""
+        customer_number = ""
         to_number = ""
+        called_number = ""
         call_sid = ""
 
     # 3. MENU Z DB -> DYNAMIC VARIABLE
@@ -461,7 +503,9 @@ async def twilio_voice_webhook(request: Request):
             conversation_initiation_client_data={
                 "dynamic_variables": {
                     "menu": menu,
-                    "caller_number": from_number,
+                    "caller_number": customer_number or from_number,
+                    "from_number": from_number,
+                    "to_number": to_number,
                     "call_sid": call_sid,
                 }
             },
@@ -671,33 +715,44 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
                 "status": "needs_confirmation",
                 "message": "Adresu sa nepodarilo spolahlivo overit. Objednavku este neuzatvarajte; vypytajte si potvrdenie ulice a cisla domu.",
                 "delivery_address": order.delivery_address,
-                "address_confidence": confidence,
+                                "address_confidence": confidence,
             }
 
-        payload_phone = str(body.get("customer_phone") or order.customer_phone or "")
+        payload_phone = _normalize_phone(body.get("customer_phone") or order.customer_phone or "")
+        payload_caller_phone = _first_customer_phone_candidate(
+            body.get("caller_number") or "",
+            body.get("from_number") or "",
+            body.get("From") or "",
+            body.get("Caller") or "",
+        )
         call_sid = str(body.get("call_sid") or body.get("CallSid") or "")
         conversation_id = str(body.get("conversation_id") or body.get("conversationId") or "")
 
         if conversation_id and call_sid and call_sid in CALL_CONTEXT:
             CONVERSATION_CONTEXT[conversation_id] = CALL_CONTEXT[call_sid]
 
-        if conversation_id and CONVERSATION_CONTEXT.get(conversation_id):
+        if conversation_id and CONVERSATION_CONTEXT.get(conversation_id) and not _is_twilio_owned_number(CONVERSATION_CONTEXT[conversation_id]):
             real_phone = CONVERSATION_CONTEXT[conversation_id]
-        elif call_sid and CALL_CONTEXT.get(call_sid):
+        elif call_sid and CALL_CONTEXT.get(call_sid) and not _is_twilio_owned_number(CALL_CONTEXT[call_sid]):
             real_phone = CALL_CONTEXT[call_sid]
-        elif _LAST_CALLER_PHONE:
+        elif payload_caller_phone:
+            real_phone = payload_caller_phone
+            print("[vytvor-objednavku] WARNING: using explicit caller_number/from_number payload fallback")
+        elif _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
             real_phone = _LAST_CALLER_PHONE
             print("[vytvor-objednavku] WARNING: using _LAST_CALLER_PHONE fallback")
-        elif payload_phone:
+        elif payload_phone and not _is_twilio_owned_number(payload_phone):
             real_phone = payload_phone
             print("[vytvor-objednavku] WARNING: using payload customer_phone fallback")
         else:
             real_phone = ""
+            print(f"[vytvor-objednavku] WARNING: no valid non-Twilio customer phone resolved; payload_phone={payload_phone}, owned={sorted(_twilio_owned_numbers())}")
 
         print(
             "[vytvor-objednavku] phone_resolution "
-            f"payload_phone={payload_phone}, call_sid={call_sid}, "
-            f"conversation_id={conversation_id}, _LAST_CALLER_PHONE={_LAST_CALLER_PHONE}, "
+            f"payload_phone={payload_phone}, payload_caller_phone={payload_caller_phone}, "
+            f"call_sid={call_sid}, conversation_id={conversation_id}, "
+            f"_LAST_CALLER_PHONE={_LAST_CALLER_PHONE}, owned_twilio_numbers={sorted(_twilio_owned_numbers())}, "
             f"final_customer_phone={real_phone}"
         )
 
