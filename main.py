@@ -115,8 +115,13 @@ _STREET_AUTO_ACCEPT_SCORE = 88
 _STREET_AUTO_ACCEPT_MARGIN = 10
 _CACHE_TTL = 300  # 5 minút
 
-# Cislo posledneho volajuceho — ulozi sa z Twilio From pri kazdom hovore
+# Docasny fallback pre posledneho volajuceho. Nepouzivat ako primarny zdroj telefonu.
 _LAST_CALLER_PHONE: str = ""
+
+# Kontext hovorov: Twilio CallSid / ElevenLabs conversation_id -> Twilio From cislo.
+CALL_CONTEXT: dict[str, str] = {}
+CONVERSATION_CONTEXT: dict[str, str] = {}
+
 
 
 def _normalize(s: str) -> str:
@@ -412,8 +417,6 @@ async def twilio_voice_webhook(request: Request):
     <Hangup/>
 </Response>'''
 
-
-
     # 1. KONTROLA SYSTÉMOV
     ok, reason = await _check_systems()
     if not ok:
@@ -430,7 +433,9 @@ async def twilio_voice_webhook(request: Request):
         if from_number:
             global _LAST_CALLER_PHONE
             _LAST_CALLER_PHONE = from_number
-            print(f"[twilio/voice] _LAST_CALLER_PHONE={from_number}")
+            if call_sid:
+                CALL_CONTEXT[call_sid] = from_number
+            print(f"[twilio/voice] _LAST_CALLER_PHONE={from_number}, CALL_CONTEXT[{call_sid}]={from_number if call_sid else ''}")
     except Exception as e:
         print(f"[twilio/voice] Chyba pri citani Twilio form data: {e}")
         from_number = ""
@@ -650,11 +655,6 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
         body = await request.json()
         print(f"[vytvor-objednavku] raw body: {body}")
 
-        # Ziskanie cisla zakaznika (prednostne z globalnej premennej)
-        global _LAST_CALLER_PHONE
-        real_phone = _LAST_CALLER_PHONE if _LAST_CALLER_PHONE else body.get("customer_phone")
-        print(f"[vytvor-objednavku] customer_phone={_LAST_CALLER_PHONE}, raw_customer_phone={body.get('customer_phone')}")
-
         order = ManageOrder(**body)
     except Exception as e:
         print(f"[vytvor-objednavku] validacna chyba: {e}")
@@ -674,8 +674,32 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
                 "address_confidence": confidence,
             }
 
-        real_phone = _LAST_CALLER_PHONE or order.customer_phone or ""
-        print(f"[vytvor-objednavku] customer_phone={real_phone}, raw_customer_phone={order.customer_phone}")
+        payload_phone = str(body.get("customer_phone") or order.customer_phone or "")
+        call_sid = str(body.get("call_sid") or body.get("CallSid") or "")
+        conversation_id = str(body.get("conversation_id") or body.get("conversationId") or "")
+
+        if conversation_id and call_sid and call_sid in CALL_CONTEXT:
+            CONVERSATION_CONTEXT[conversation_id] = CALL_CONTEXT[call_sid]
+
+        if conversation_id and CONVERSATION_CONTEXT.get(conversation_id):
+            real_phone = CONVERSATION_CONTEXT[conversation_id]
+        elif call_sid and CALL_CONTEXT.get(call_sid):
+            real_phone = CALL_CONTEXT[call_sid]
+        elif _LAST_CALLER_PHONE:
+            real_phone = _LAST_CALLER_PHONE
+            print("[vytvor-objednavku] WARNING: using _LAST_CALLER_PHONE fallback")
+        elif payload_phone:
+            real_phone = payload_phone
+            print("[vytvor-objednavku] WARNING: using payload customer_phone fallback")
+        else:
+            real_phone = ""
+
+        print(
+            "[vytvor-objednavku] phone_resolution "
+            f"payload_phone={payload_phone}, call_sid={call_sid}, "
+            f"conversation_id={conversation_id}, _LAST_CALLER_PHONE={_LAST_CALLER_PHONE}, "
+            f"final_customer_phone={real_phone}"
+        )
 
         order_data = {
             "tenant_id": TENANT_ID,
@@ -715,8 +739,11 @@ async def end_call(request: Request):
     except Exception:
         body = {}
 
-    call_sid = body.get("call_sid") or body.get("CallSid") or body.get("conversation_id")
-    print(f"[end_call] hovor ukonceny, call_sid={call_sid}, payload={body}")
+    call_sid = body.get("call_sid") or body.get("CallSid") or ""
+    conversation_id = body.get("conversation_id") or body.get("conversationId") or ""
+    if conversation_id and call_sid and call_sid in CALL_CONTEXT:
+        CONVERSATION_CONTEXT[conversation_id] = CALL_CONTEXT[call_sid]
+    print(f"[end_call] hovor ukonceny, call_sid={call_sid}, conversation_id={conversation_id}, payload={body}")
 
     # Pokus o zavesenie priamo cez Twilio API (ak mame CallSid a credentials)
     twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
