@@ -541,7 +541,9 @@ async def send_whatsapp_message(to: str, message: str, template_sid: str = None,
                 auth=(twilio_account_sid, twilio_auth_token),
                 timeout=10.0
             )
-        print(f"[whatsapp] Twilio response: {resp.status_code} - {resp.text}")
+        
+        if resp.status_code not in [200, 201]:
+            print(f"[whatsapp] CHYBA pri odosielani: {resp.status_code}")
         return resp.status_code in [200, 201]
     except Exception as e:
         print(f"[whatsapp] CHYBA: {e}")
@@ -572,7 +574,7 @@ async def send_order_notifications_task(order_data: dict):
         vars_cust = {"1": pizza, "2": address, "3": price}
         await send_whatsapp_message(phone, msg_cust, TPL_CUSTOMER, vars_cust)
     
-    print(f"[whatsapp] Notifikacie spracovane.")
+    print(f"[notifikacie] Objednávka {pizza} spracovaná.")
 
 
 @app.post("/api/vytvor-objednavku")
@@ -583,13 +585,11 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
     """
     try:
         body = await request.json()
-        print(f"[vytvor-objednavku] raw body: {body}")
-
+        
         # Ziskanie cisla zakaznika (prednostne z globalnej premennej)
         global _LAST_CALLER_PHONE
         real_phone = _LAST_CALLER_PHONE if _LAST_CALLER_PHONE else body.get("customer_phone")
-        print(f"[vytvor-objednavku] customer_phone={_LAST_CALLER_PHONE}, raw_customer_phone={body.get('customer_phone')}")
-
+        
         order = ManageOrder(**body)
         order_data = {
             "tenant_id": TENANT_ID,
