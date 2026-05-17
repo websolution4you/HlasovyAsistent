@@ -698,11 +698,11 @@ async def search_street(body: SearchStreetRequest):
         }
         candidates.append(candidate)
         
-    top_old_style = [{"street": item["street"], "score": item["score"]} for item in resolution["suggestions"]]
+        top_old_style = [{"street": item["street"], "score": item["score"]} for item in resolution["suggestions"]]
 
     print(f"[search-street] top_results={top_old_style} margin={resolution['margin']} auto_accept={resolution['auto_accept']}")
 
-        try:
+    try:
         if not candidates:
             return {
                 "ok": False,
