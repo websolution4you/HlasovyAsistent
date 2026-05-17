@@ -111,7 +111,7 @@ ALLERGEN_MAP = {
 
 _STREETS_CACHE: dict = {"data": [], "tenant_id": "", "timestamp": 0.0}
 _STREET_MIN_SCORE = 60
-_STREET_AUTO_ACCEPT_SCORE = 80
+_STREET_AUTO_ACCEPT_SCORE = 90
 _STREET_AUTO_ACCEPT_MARGIN = 5
 _CACHE_TTL = 300  # 5 minút
 
@@ -777,13 +777,15 @@ async def search_street(body: SearchStreetRequest):
                 best_candidate["requires_confirmation"] = True
                 best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
 
-        needs_confirmation = not resolution["auto_accept"] or best_candidate["requires_confirmation"]
+                needs_confirmation = not resolution["auto_accept"] or best_candidate["requires_confirmation"]
 
         # Pre stary parameter message:
-        if needs_confirmation:
-            message = "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu ulicu a vypytajte si jasne ano/nie potvrdenie."
-        if best_candidate["match_type"] == "ambiguous":
-            message = "Nájdených viacero možností. Poproste zákazníka, aby upresnil ulicu."
+        if best_candidate["match_type"] == "not_found" or not top_old_style:
+            message = "Nerozumel som presne nazvu ulice. Poproste zakaznika, aby ulicu zopakoval po pismenach alebo povedal blizsi orientacny bod."
+        elif best_candidate["match_type"] == "ambiguous":
+            message = "Adresa je nejednoznacna. Poproste zakaznika, aby adresu zopakoval alebo spresnil."
+        elif needs_confirmation:
+            message = "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu adresu a vypytajte si jasne ano/nie potvrdenie."
         else:
             message = "Ulica najdena a potvrdzena."
             
