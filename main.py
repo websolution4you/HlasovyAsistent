@@ -605,6 +605,16 @@ async def prompt_config():
     }
 
 
+def build_address_message(found: bool, needs_confirmation: bool, best_match: str | None, match_type: str) -> str:
+    if match_type == "ambiguous":
+        return "Adresa je nejednoznacna. Poproste zakaznika, aby adresu zopakoval alebo spresnil."
+    if found is True and needs_confirmation is False:
+        return "Ulica najdena a potvrdzena."
+    if needs_confirmation is True and best_match:
+        return "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu adresu a vypytajte si jasne ano/nie potvrdenie."
+    return "Nerozumel som presne nazvu ulice. Poproste zakaznika, aby ulicu zopakoval po pismenach alebo povedal blizsi orientacny bod."
+
+
 @app.post("/api/search-street")
 async def search_street(body: SearchStreetRequest):
     """
@@ -729,6 +739,14 @@ async def search_street(body: SearchStreetRequest):
     print(f"[search-street] top_results={top_old_style} margin={resolution['margin']} auto_accept={resolution['auto_accept']}")
 
     try:
+        found = False
+        needs_confirmation = True
+        best_match = None
+        confidence = 0
+        match_type = "not_found"
+        requires_confirmation = False
+        message = "Nerozumel som presne nazvu ulice. Poproste zakaznika, aby ulicu zopakoval po pismenach alebo povedal blizsi orientacny bod."
+
         if not candidates:
             return {
                 "ok": False,
@@ -767,26 +785,22 @@ async def search_street(body: SearchStreetRequest):
             else:
                 is_significantly_shorter = len(top2_norm) < (len(top1_norm) * 0.70)
             
-                if (
+            if (
                 top1_score >= _STREET_MIN_SCORE
                 and top2_score >= 75
                 and margin_score <= 4
                 and not is_significantly_shorter):
-                    best_candidate["match_type"] = "ambiguous"
-                    best_candidate["requires_confirmation"] = True
-                    best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
+                best_candidate["match_type"] = "ambiguous"
+                best_candidate["requires_confirmation"] = True
+                best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
 
         needs_confirmation = not resolution["auto_accept"] or best_candidate["requires_confirmation"]
-
-        # Pre stary parameter message:
-        if best_candidate["match_type"] == "not_found" or not top_old_style:
-            message = "Nerozumel som presne nazvu ulice. Poproste zakaznika, aby ulicu zopakoval po pismenach alebo povedal blizsi orientacny bod."
-        elif best_candidate["match_type"] == "ambiguous":
-            message = "Adresa je nejednoznacna. Poproste zakaznika, aby adresu zopakoval alebo spresnil."
-        elif needs_confirmation:
-            message = "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu adresu a vypytajte si jasne ano/nie potvrdenie."
-        else:
-            message = "Ulica najdena a potvrdzena."
+        found = not needs_confirmation
+        best_match = top_old_style[0]["street"] if top_old_style else None
+        confidence = top_old_style[0]["score"] if top_old_style else 0
+        match_type = best_candidate["match_type"]
+        
+        message = build_address_message(found, needs_confirmation, best_match, match_type)
             
         full_address = None
         if top_old_style:
@@ -811,9 +825,9 @@ async def search_street(body: SearchStreetRequest):
                 "match_type": best_candidate["match_type"],
                 "requires_confirmation": needs_confirmation
             },
-            "found": not needs_confirmation, # Starý agent možno očakáva found=True len pri auto_accept
-            "best_match": top_old_style[0]["street"],
-            "confidence": top_old_style[0]["score"],
+            "found": found,
+            "best_match": best_match,
+            "confidence": confidence,
             "needs_confirmation": needs_confirmation,
             "margin": resolution["margin"],
             "message": message,
