@@ -720,12 +720,24 @@ async def search_street(body: SearchStreetRequest):
             "debug": debug_info
         }
         
-    best_candidate = candidates[0]
+        best_candidate = candidates[0]
     
-        # Detekcia ambiguous (viacero relevantnych kandidatov s podobnym skore)
+    # Detekcia ambiguous (viacero relevantnych kandidatov s podobnym skore)
     if len(candidates) > 1:
-        margin_confidence = best_candidate["confidence"] - candidates[1]["confidence"]
-        if margin_confidence < 0.10: # Ak je rozdiel v confidence < 0.10
+        top1_score = best_candidate["confidence"] * 100
+        top2_score = candidates[1]["confidence"] * 100
+        margin_score = top1_score - top2_score
+        
+        top1_norm = _normalize(best_candidate["address"])
+        top2_norm = _normalize(candidates[1]["address"])
+        is_significantly_shorter = len(top2_norm) < (len(top1_norm) * 0.70)
+        
+        if (
+            top1_score >= _STREET_MIN_SCORE
+            and top2_score >= 75
+            and margin_score <= 4
+            and not is_significantly_shorter
+        ):
             best_candidate["match_type"] = "ambiguous"
             best_candidate["requires_confirmation"] = True
             best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
