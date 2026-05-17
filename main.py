@@ -286,6 +286,9 @@ def _get_streets_cached(tenant_id: str) -> list[str]:
     ):
         return _STREETS_CACHE["data"]
 
+    if not supabase:
+        raise Exception("Supabase klient nie je inicializovany")
+
     result = supabase.table("streets").select("name").execute()
     streets = [row["name"] for row in result.data] if result.data else []
     _STREETS_CACHE.update({"data": streets, "tenant_id": tenant_id, "timestamp": now})
@@ -405,13 +408,12 @@ def match_street(raw_address: str, tenant_id: str) -> tuple[Optional[str], int]:
         return raw_address, 0
 
     try:
-        result = supabase.table("streets").select("name").execute()
-        if not result.data:
+        streets = _get_streets_cached(tenant_id)
+        if not streets:
             return raw_address, 0
 
         address = raw_address.strip()
-        street_names = [s["name"] for s in result.data]
-        resolution = _street_resolution(address, street_names)
+        resolution = _street_resolution(address, streets)
         best = resolution["best"]
         if not best:
             print(f"Address no match: '{address}'")
@@ -660,13 +662,17 @@ async def search_street(body: SearchStreetRequest):
 
     resolution = _street_resolution(query, streets)
     
-    # DEBUG OBJEKT
+        # DEBUG OBJEKT
     debug_info = {
         "street_min_score": _STREET_MIN_SCORE,
         "street_auto_accept_score": _STREET_AUTO_ACCEPT_SCORE,
         "street_auto_accept_margin": _STREET_AUTO_ACCEPT_MARGIN,
         "raw_query": query,
         "normalized_query": _normalize(query),
+        "street_source": "supabase",
+        "street_count": len(streets),
+        "tenant_id": TENANT_ID,
+        "fallback_used": False,
         "top_raw_candidates": [
             {
                 "street": item["street"],
@@ -716,7 +722,7 @@ async def search_street(body: SearchStreetRequest):
         
     best_candidate = candidates[0]
     
-    # Detekcia ambiguous (viacero relevantnych kandidatov s podobnym skore)
+        # Detekcia ambiguous (viacero relevantnych kandidatov s podobnym skore)
     if len(candidates) > 1:
         margin_confidence = best_candidate["confidence"] - candidates[1]["confidence"]
         if margin_confidence < 0.10: # Ak je rozdiel v confidence < 0.10
@@ -734,7 +740,7 @@ async def search_street(body: SearchStreetRequest):
     else:
         message = "Ulica najdena a potvrdzena."
 
-        return {
+    return {
         "ok": True,
         "input": query,
         "query": query,
