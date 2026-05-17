@@ -659,7 +659,7 @@ async def search_street(body: SearchStreetRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Chyba pri nacitani ulic: {e}")
 
-            if not streets:
+    if not streets:
         return {
             "ok": False,
             "input": original_query,
@@ -680,7 +680,7 @@ async def search_street(body: SearchStreetRequest):
             "suggestions": []
         }
 
-        print(f"[search-street] query='{street_query}' streets_count={len(streets)}")
+    print(f"[search-street] query='{street_query}' streets_count={len(streets)}")
 
     resolution = _street_resolution(street_query, streets)
     
@@ -728,7 +728,7 @@ async def search_street(body: SearchStreetRequest):
 
     print(f"[search-street] top_results={top_old_style} margin={resolution['margin']} auto_accept={resolution['auto_accept']}")
 
-            try:
+    try:
         if not candidates:
             return {
                 "ok": False,
