@@ -782,9 +782,9 @@ async def search_street(body: SearchStreetRequest):
         # Pre stary parameter message:
         if needs_confirmation:
             message = "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu ulicu a vypytajte si jasne ano/nie potvrdenie."
-            if best_candidate["match_type"] == "ambiguous":
-                message = "Nájdených viacero možností. Poproste zákazníka, aby upresnil ulicu."
-            else:
+        if best_candidate["match_type"] == "ambiguous":
+            message = "Nájdených viacero možností. Poproste zákazníka, aby upresnil ulicu."
+        else:
             message = "Ulica najdena a potvrdzena."
             
         full_address = None
