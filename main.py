@@ -112,7 +112,7 @@ ALLERGEN_MAP = {
 _STREETS_CACHE: dict = {"data": [], "tenant_id": "", "timestamp": 0.0}
 _STREET_MIN_SCORE = 60
 _STREET_AUTO_ACCEPT_SCORE = 90
-_STREET_AUTO_ACCEPT_MARGIN = 10
+_STREET_AUTO_ACCEPT_MARGIN = 5
 _CACHE_TTL = 300  # 5 minút
 
 # Docasny fallback pre posledneho volajuceho. Nepouzivat ako primarny zdroj telefonu.
@@ -702,76 +702,100 @@ async def search_street(body: SearchStreetRequest):
 
     print(f"[search-street] top_results={top_old_style} margin={resolution['margin']} auto_accept={resolution['auto_accept']}")
 
-    if not candidates:
+        try:
+        if not candidates:
+            return {
+                "ok": False,
+                "input": query,
+                "query": query,
+                "candidates": [],
+                "selected_candidate": None,
+                "match_type": "not_found",
+                "requires_confirmation": False,
+                "reason": "Nenašiel sa žiadny vhodný kandidát.",
+                "found": False,
+                "needs_confirmation": True,
+                "best_match": None,
+                "message": "Nerozumel som presne nazvu ulice. Poproste zakaznika, aby ulicu zopakoval po pismenach alebo povedal blizsi orientacny bod.",
+                "suggestions": [],
+                "debug": debug_info
+            }
+            
+        best_candidate = candidates[0]
+        
+        # Detekcia ambiguous (viacero relevantnych kandidatov s podobnym skore)
+        if len(candidates) > 1:
+            top1_score = best_candidate["confidence"] * 100
+            top2_score = candidates[1]["confidence"] * 100
+            margin_score = top1_score - top2_score
+            
+            top1_norm = _normalize(str(best_candidate.get("address") or ""))
+            top2_norm = _normalize(str(candidates[1].get("address") or ""))
+            
+            if not top1_norm or not top2_norm:
+                is_significantly_shorter = False
+            else:
+                is_significantly_shorter = len(top2_norm) < (len(top1_norm) * 0.70)
+            
+            if (
+                top1_score >= _STREET_MIN_SCORE
+                and top2_score >= 75
+                and margin_score <= 4
+                and not is_significantly_shorter
+            ):
+                best_candidate["match_type"] = "ambiguous"
+                best_candidate["requires_confirmation"] = True
+                best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
+
+        needs_confirmation = not resolution["auto_accept"] or best_candidate["requires_confirmation"]
+
+        # Pre stary parameter message:
+        if needs_confirmation:
+            message = "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu ulicu a vypytajte si jasne ano/nie potvrdenie."
+            if best_candidate["match_type"] == "ambiguous":
+                message = "Nájdených viacero možností. Poproste zákazníka, aby upresnil ulicu."
+        else:
+            message = "Ulica najdena a potvrdzena."
+
+        return {
+            "ok": True,
+            "input": query,
+            "query": query,
+            "candidates": candidates,
+            "selected_candidate": {
+                "address": best_candidate["address"],
+                "confidence": best_candidate["confidence"],
+                "match_type": best_candidate["match_type"],
+                "requires_confirmation": needs_confirmation
+            },
+            "found": not needs_confirmation, # Starý agent možno očakáva found=True len pri auto_accept
+            "best_match": top_old_style[0]["street"],
+            "confidence": top_old_style[0]["score"],
+            "needs_confirmation": needs_confirmation,
+            "margin": resolution["margin"],
+            "message": message,
+            "suggestions": top_old_style,
+            "debug": debug_info
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {
             "ok": False,
             "input": query,
             "query": query,
             "candidates": [],
             "selected_candidate": None,
-            "match_type": "not_found",
+            "match_type": "error",
             "requires_confirmation": False,
-            "reason": "Nenašiel sa žiadny vhodný kandidát.",
+            "reason": f"Interna chyba pri spracovani adresy: {str(e)}",
             "found": False,
             "needs_confirmation": True,
             "best_match": None,
-            "message": "Nerozumel som presne nazvu ulice. Poproste zakaznika, aby ulicu zopakoval po pismenach alebo povedal blizsi orientacny bod.",
+            "message": "Nastala chyba pri vyhladavani adresy.",
             "suggestions": [],
             "debug": debug_info
         }
-        
-        best_candidate = candidates[0]
-    
-    # Detekcia ambiguous (viacero relevantnych kandidatov s podobnym skore)
-    if len(candidates) > 1:
-        top1_score = best_candidate["confidence"] * 100
-        top2_score = candidates[1]["confidence"] * 100
-        margin_score = top1_score - top2_score
-        
-        top1_norm = _normalize(best_candidate["address"])
-        top2_norm = _normalize(candidates[1]["address"])
-        is_significantly_shorter = len(top2_norm) < (len(top1_norm) * 0.70)
-        
-        if (
-            top1_score >= _STREET_MIN_SCORE
-            and top2_score >= 75
-            and margin_score <= 4
-            and not is_significantly_shorter
-        ):
-            best_candidate["match_type"] = "ambiguous"
-            best_candidate["requires_confirmation"] = True
-            best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
-
-    needs_confirmation = not resolution["auto_accept"] or best_candidate["requires_confirmation"]
-
-    # Pre stary parameter message:
-    if needs_confirmation:
-        message = "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu ulicu a vypytajte si jasne ano/nie potvrdenie."
-        if best_candidate["match_type"] == "ambiguous":
-            message = "Nájdených viacero možností. Poproste zákazníka, aby upresnil ulicu."
-    else:
-        message = "Ulica najdena a potvrdzena."
-
-    return {
-        "ok": True,
-        "input": query,
-        "query": query,
-        "candidates": candidates,
-        "selected_candidate": {
-            "address": best_candidate["address"],
-            "confidence": best_candidate["confidence"],
-            "match_type": best_candidate["match_type"],
-            "requires_confirmation": needs_confirmation
-        },
-        "found": not needs_confirmation, # Starý agent možno očakáva found=True len pri auto_accept
-        "best_match": top_old_style[0]["street"],
-        "confidence": top_old_style[0]["score"],
-        "needs_confirmation": needs_confirmation,
-        "margin": resolution["margin"],
-        "message": message,
-        "suggestions": top_old_style,
-        "debug": debug_info
-    }
 
 # --- WHATSAPP LOGIKA (DOPLNOK) ---
 
