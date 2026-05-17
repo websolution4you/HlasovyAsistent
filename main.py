@@ -258,7 +258,7 @@ def _rank_streets(raw_address: str, streets: list[str]) -> list[dict]:
 
 def _street_resolution(raw_address: str, streets: list[str]) -> dict:
     ranked = _rank_streets(raw_address, streets)
-    top = [item for item in ranked[:2] if item["score"] >= _STREET_MIN_SCORE]
+    top = [item for item in ranked[:5] if item["score"] >= _STREET_MIN_SCORE]
     best = top[0] if top else None
     second = top[1] if len(top) > 1 else None
     margin = best["score"] - second["score"] if best and second else 100
@@ -272,6 +272,7 @@ def _street_resolution(raw_address: str, streets: list[str]) -> dict:
         "suggestions": top,
         "margin": margin,
         "auto_accept": auto_accept,
+        "all_ranked_top5": ranked[:5] # pridany debug pre zistenie pred odfiltrovanim
     }
 
 
@@ -655,9 +656,26 @@ async def search_street(body: SearchStreetRequest):
             "suggestions": []
         }
 
-    print(f"[search-street] query='{query}' streets_count={len(streets)}")
+        print(f"[search-street] query='{query}' streets_count={len(streets)}")
 
     resolution = _street_resolution(query, streets)
+    
+    # DEBUG OBJEKT
+    debug_info = {
+        "street_min_score": _STREET_MIN_SCORE,
+        "street_auto_accept_score": _STREET_AUTO_ACCEPT_SCORE,
+        "street_auto_accept_margin": _STREET_AUTO_ACCEPT_MARGIN,
+        "raw_query": query,
+        "normalized_query": _normalize(query),
+        "top_raw_candidates": [
+            {
+                "street": item["street"],
+                "score": item["score"],
+                "normalized_street": _normalize(item["street"])
+            }
+            for item in resolution.get("all_ranked_top5", [])
+        ]
+    }
     
     candidates = []
     
@@ -693,6 +711,7 @@ async def search_street(body: SearchStreetRequest):
             "best_match": None,
             "message": "Nerozumel som presne nazvu ulice. Poproste zakaznika, aby ulicu zopakoval po pismenach alebo povedal blizsi orientacny bod.",
             "suggestions": [],
+            "debug": debug_info
         }
         
     best_candidate = candidates[0]
@@ -715,7 +734,7 @@ async def search_street(body: SearchStreetRequest):
     else:
         message = "Ulica najdena a potvrdzena."
 
-    return {
+        return {
         "ok": True,
         "input": query,
         "query": query,
@@ -733,6 +752,7 @@ async def search_street(body: SearchStreetRequest):
         "margin": resolution["margin"],
         "message": message,
         "suggestions": top_old_style,
+        "debug": debug_info
     }
 
 # --- WHATSAPP LOGIKA (DOPLNOK) ---
