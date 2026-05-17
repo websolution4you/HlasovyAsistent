@@ -767,17 +767,16 @@ async def search_street(body: SearchStreetRequest):
             else:
                 is_significantly_shorter = len(top2_norm) < (len(top1_norm) * 0.70)
             
-            if (
+                if (
                 top1_score >= _STREET_MIN_SCORE
                 and top2_score >= 75
                 and margin_score <= 4
-                and not is_significantly_shorter
-            ):
-                best_candidate["match_type"] = "ambiguous"
-                best_candidate["requires_confirmation"] = True
-                best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
+                and not is_significantly_shorter):
+                    best_candidate["match_type"] = "ambiguous"
+                    best_candidate["requires_confirmation"] = True
+                    best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
 
-                needs_confirmation = not resolution["auto_accept"] or best_candidate["requires_confirmation"]
+        needs_confirmation = not resolution["auto_accept"] or best_candidate["requires_confirmation"]
 
         # Pre stary parameter message:
         if best_candidate["match_type"] == "not_found" or not top_old_style:
