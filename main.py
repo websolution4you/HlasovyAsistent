@@ -111,7 +111,7 @@ ALLERGEN_MAP = {
 
 _STREETS_CACHE: dict = {"data": [], "tenant_id": "", "timestamp": 0.0}
 _STREET_MIN_SCORE = 60
-_STREET_AUTO_ACCEPT_SCORE = 90
+_STREET_AUTO_ACCEPT_SCORE = 80
 _STREET_AUTO_ACCEPT_MARGIN = 5
 _CACHE_TTL = 300  # 5 minút
 
@@ -614,13 +614,31 @@ async def search_street(body: SearchStreetRequest):
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
 
-    query = body.query.strip()
-    if not query:
+    original_query = body.query.strip()
+    query = original_query
+    
+    import re
+    # Extrakcia cisla domu (ak konci na cislo s volitelnym pismenom, napr. "12A")
+    match = re.search(r'^(.*?)\s+([\d]+[a-zA-Z]?)$', query)
+    if match:
+        street_query = match.group(1).strip()
+        house_number = match.group(2)
+        had_house_number = True
+    else:
+        street_query = query
+        house_number = None
+        had_house_number = False
+
+    if not street_query:
         # Prazdny vstup
         return {
             "ok": False,
-            "input": query,
-            "query": query,
+            "input": original_query,
+            "query": original_query,
+            "street_query": street_query,
+            "house_number": house_number,
+            "had_house_number": had_house_number,
+            "full_address": None,
             "candidates": [],
             "selected_candidate": None,
             "match_type": "not_found",
@@ -641,11 +659,15 @@ async def search_street(body: SearchStreetRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Chyba pri nacitani ulic: {e}")
 
-    if not streets:
+            if not streets:
         return {
             "ok": False,
-            "input": query,
-            "query": query,
+            "input": original_query,
+            "query": original_query,
+            "street_query": street_query,
+            "house_number": house_number,
+            "had_house_number": had_house_number,
+            "full_address": None,
             "candidates": [],
             "selected_candidate": None,
             "match_type": "not_found",
@@ -658,17 +680,21 @@ async def search_street(body: SearchStreetRequest):
             "suggestions": []
         }
 
-        print(f"[search-street] query='{query}' streets_count={len(streets)}")
+        print(f"[search-street] query='{street_query}' streets_count={len(streets)}")
 
-    resolution = _street_resolution(query, streets)
+    resolution = _street_resolution(street_query, streets)
     
         # DEBUG OBJEKT
     debug_info = {
         "street_min_score": _STREET_MIN_SCORE,
         "street_auto_accept_score": _STREET_AUTO_ACCEPT_SCORE,
         "street_auto_accept_margin": _STREET_AUTO_ACCEPT_MARGIN,
-        "raw_query": query,
-        "normalized_query": _normalize(query),
+        "raw_query": street_query,
+        "original_query": original_query,
+        "street_query": street_query,
+        "extracted_house_number": house_number,
+        "had_house_number": had_house_number,
+        "normalized_query": _normalize(street_query),
         "street_source": "supabase",
         "street_count": len(streets),
         "tenant_id": TENANT_ID,
@@ -685,10 +711,10 @@ async def search_street(body: SearchStreetRequest):
     
     candidates = []
     
-    # Vybuduj zoznam candidates v pozadovanom formate
+            # Vybuduj zoznam candidates v pozadovanom formate
     for item in resolution["suggestions"]:
         street = item["street"]
-        classification = classify_address_match(query, street, item["score"])
+        classification = classify_address_match(street_query, street, item["score"])
         candidate = {
             "address": street,
             "confidence": classification["confidence"],
@@ -702,12 +728,16 @@ async def search_street(body: SearchStreetRequest):
 
     print(f"[search-street] top_results={top_old_style} margin={resolution['margin']} auto_accept={resolution['auto_accept']}")
 
-    try:
+            try:
         if not candidates:
             return {
                 "ok": False,
-                "input": query,
-                "query": query,
+                "input": original_query,
+                "query": original_query,
+                "street_query": street_query,
+                "house_number": house_number,
+                "had_house_number": had_house_number,
+                "full_address": None,
                 "candidates": [],
                 "selected_candidate": None,
                 "match_type": "not_found",
@@ -754,13 +784,25 @@ async def search_street(body: SearchStreetRequest):
             message = "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu ulicu a vypytajte si jasne ano/nie potvrdenie."
             if best_candidate["match_type"] == "ambiguous":
                 message = "Nájdených viacero možností. Poproste zákazníka, aby upresnil ulicu."
-        else:
+            else:
             message = "Ulica najdena a potvrdzena."
+            
+        full_address = None
+        if top_old_style:
+            best_match_str = top_old_style[0]["street"]
+            if house_number:
+                full_address = f"{best_match_str} {house_number}"
+            else:
+                full_address = best_match_str
 
         return {
             "ok": True,
-            "input": query,
-            "query": query,
+            "input": original_query,
+            "query": original_query,
+            "street_query": street_query,
+            "house_number": house_number,
+            "had_house_number": had_house_number,
+            "full_address": full_address,
             "candidates": candidates,
             "selected_candidate": {
                 "address": best_candidate["address"],
@@ -782,8 +824,12 @@ async def search_street(body: SearchStreetRequest):
         traceback.print_exc()
         return {
             "ok": False,
-            "input": query,
-            "query": query,
+            "input": original_query,
+            "query": original_query,
+            "street_query": street_query,
+            "house_number": house_number,
+            "had_house_number": had_house_number,
+            "full_address": None,
             "candidates": [],
             "selected_candidate": None,
             "match_type": "error",
