@@ -158,6 +158,53 @@ def _normalize(s: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
+def similarity_score(a: str, b: str) -> float:
+    # vráti číslo 0.0 až 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def classify_address_match(input_text: str, candidate_address: str, existing_score: float = None) -> dict:
+    # vráti confidence, match_type, requires_confirmation, reason
+    input_norm = _normalize(input_text)
+    candidate_norm = _normalize(candidate_address)
+    
+    if existing_score is not None:
+        # Pouzijeme skóre od 0 do 1
+        score = existing_score / 100.0 if existing_score > 1.0 else existing_score
+    else:
+        # Fallback na SequenceMatcher, ak skóre chýba
+        score = similarity_score(input_norm, candidate_norm)
+    
+    if input_norm == candidate_norm or score >= 0.98:
+        return {
+            "confidence": round(score, 2),
+            "match_type": "exact",
+            "requires_confirmation": False,
+            "reason": "Presná zhoda."
+        }
+    elif score >= 0.90:
+        return {
+            "confidence": round(score, 2),
+            "match_type": "normalized",
+            "requires_confirmation": True,
+            "reason": "Vysoká podobnosť (líši sa formátovanie alebo preklep)."
+        }
+    elif score >= 0.60:
+        return {
+            "confidence": round(score, 2),
+            "match_type": "fuzzy",
+            "requires_confirmation": True,
+            "reason": "Čiastočná zhoda (zrejme preklep alebo časť názvu)."
+        }
+    else:
+        return {
+            "confidence": round(score, 2),
+            "match_type": "low_confidence",
+            "requires_confirmation": True,
+            "reason": "Veľmi slabá zhoda."
+        }
+
+
 def _street_score(query: str, street: str) -> tuple[int, int]:
     """Vráti (primary_score, ratio) — primary uprednostňuje presnejšiu/kratšiu zhodu.
     partial_ratio je penalizovaný 0.85x, aby kratší presný match vyhral nad substrinom.
@@ -566,7 +613,23 @@ async def search_street(body: SearchStreetRequest):
 
     query = body.query.strip()
     if not query:
-        raise HTTPException(status_code=422, detail="Parameter query nesmie byt prazdny.")
+        # Prazdny vstup
+        return {
+            "ok": False,
+            "input": query,
+            "query": query,
+            "candidates": [],
+            "selected_candidate": None,
+            "match_type": "not_found",
+            "requires_confirmation": False,
+            "reason": "Prázdny dopyt.",
+            # Zachovanie starych odpovedi pre kompatibilitu
+            "found": False,
+            "needs_confirmation": False,
+            "best_match": None,
+            "message": "Nezadal si žiadnu ulicu.",
+            "suggestions": []
+        }
 
     try:
         streets = _get_streets_cached(TENANT_ID)
@@ -576,40 +639,100 @@ async def search_street(body: SearchStreetRequest):
         raise HTTPException(status_code=500, detail=f"Chyba pri nacitani ulic: {e}")
 
     if not streets:
-        return {"found": False, "message": "Na tuto adresu momentalne nevieme dorucit.", "suggestions": []}
+        return {
+            "ok": False,
+            "input": query,
+            "query": query,
+            "candidates": [],
+            "selected_candidate": None,
+            "match_type": "not_found",
+            "requires_confirmation": False,
+            "reason": "Nenašiel sa žiadny vhodný kandidát. (Zoznam ulíc je prázdny.)",
+            "found": False,
+            "needs_confirmation": False,
+            "best_match": None,
+            "message": "Na tuto adresu momentalne nevieme dorucit.", 
+            "suggestions": []
+        }
 
     print(f"[search-street] query='{query}' streets_count={len(streets)}")
 
     resolution = _street_resolution(query, streets)
-    top = [{"street": item["street"], "score": item["score"]} for item in resolution["suggestions"]]
+    
+    candidates = []
+    
+    # Vybuduj zoznam candidates v pozadovanom formate
+    for item in resolution["suggestions"]:
+        street = item["street"]
+        classification = classify_address_match(query, street, item["score"])
+        candidate = {
+            "address": street,
+            "confidence": classification["confidence"],
+            "match_type": classification["match_type"],
+            "requires_confirmation": classification["requires_confirmation"],
+            "reason": classification["reason"]
+        }
+        candidates.append(candidate)
+        
+    top_old_style = [{"street": item["street"], "score": item["score"]} for item in resolution["suggestions"]]
 
-    print(f"[search-street] top_results={top} margin={resolution['margin']} auto_accept={resolution['auto_accept']}")
+    print(f"[search-street] top_results={top_old_style} margin={resolution['margin']} auto_accept={resolution['auto_accept']}")
 
-    if not top:
+    if not candidates:
         return {
+            "ok": False,
+            "input": query,
+            "query": query,
+            "candidates": [],
+            "selected_candidate": None,
+            "match_type": "not_found",
+            "requires_confirmation": False,
+            "reason": "Nenašiel sa žiadny vhodný kandidát.",
             "found": False,
             "needs_confirmation": True,
+            "best_match": None,
             "message": "Nerozumel som presne nazvu ulice. Poproste zakaznika, aby ulicu zopakoval po pismenach alebo povedal blizsi orientacny bod.",
             "suggestions": [],
         }
+        
+    best_candidate = candidates[0]
+    
+    # Detekcia ambiguous (viacero relevantnych kandidatov s podobnym skore)
+    if len(candidates) > 1:
+        margin_confidence = best_candidate["confidence"] - candidates[1]["confidence"]
+        if margin_confidence < 0.10: # Ak je rozdiel v confidence < 0.10
+            best_candidate["match_type"] = "ambiguous"
+            best_candidate["requires_confirmation"] = True
+            best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
 
-    if not resolution["auto_accept"]:
-        return {
-            "found": False,
-            "needs_confirmation": True,
-            "message": "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu ulicu a vypytajte si jasne ano/nie potvrdenie.",
-            "best_match": top[0]["street"],
-            "confidence": top[0]["score"],
-            "margin": resolution["margin"],
-            "suggestions": top,
-        }
+    needs_confirmation = not resolution["auto_accept"] or best_candidate["requires_confirmation"]
+
+    # Pre stary parameter message:
+    if needs_confirmation:
+        message = "Adresa je neista. Nepotvrdzujte objednavku; najprv zakaznikovi precitajte najpravdepodobnejsiu ulicu a vypytajte si jasne ano/nie potvrdenie."
+        if best_candidate["match_type"] == "ambiguous":
+            message = "Nájdených viacero možností. Poproste zákazníka, aby upresnil ulicu."
+    else:
+        message = "Ulica najdena a potvrdzena."
 
     return {
-        "found": True,
-        "best_match": top[0]["street"],
-        "confidence": top[0]["score"],
-        "needs_confirmation": False,
-        "suggestions": top,
+        "ok": True,
+        "input": query,
+        "query": query,
+        "candidates": candidates,
+        "selected_candidate": {
+            "address": best_candidate["address"],
+            "confidence": best_candidate["confidence"],
+            "match_type": best_candidate["match_type"],
+            "requires_confirmation": needs_confirmation
+        },
+        "found": not needs_confirmation, # Starý agent možno očakáva found=True len pri auto_accept
+        "best_match": top_old_style[0]["street"],
+        "confidence": top_old_style[0]["score"],
+        "needs_confirmation": needs_confirmation,
+        "margin": resolution["margin"],
+        "message": message,
+        "suggestions": top_old_style,
     }
 
 # --- WHATSAPP LOGIKA (DOPLNOK) ---
