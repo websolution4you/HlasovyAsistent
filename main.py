@@ -1,6 +1,7 @@
 import os
 import time
 import unicodedata
+from difflib import SequenceMatcher
 from html import escape as xml_escape
 from rapidfuzz import fuzz
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
@@ -111,7 +112,7 @@ ALLERGEN_MAP = {
 
 _STREETS_CACHE: dict = {"data": [], "tenant_id": "", "timestamp": 0.0}
 _STREET_MIN_SCORE = 60
-_STREET_AUTO_ACCEPT_SCORE = 90
+_STREET_AUTO_ACCEPT_SCORE = 85
 _STREET_AUTO_ACCEPT_MARGIN = 5
 _CACHE_TTL = 300  # 5 minút
 
@@ -153,9 +154,23 @@ def _first_customer_phone_candidate(*phones: str) -> str:
 
 
 def _normalize(s: str) -> str:
-    """Lowercase + odstránenie diakritiky."""
+    """Lowercase + odstránenie diakritiky + slovensko-fonetická normalizácia pre hlasových asistentov."""
+    if not s:
+        return ""
+    import re
+    # 1. Odstránenie diakritiky
     nfkd = unicodedata.normalize("NFD", s.lower().strip())
-    return "".join(c for c in nfkd if not unicodedata.combining(c))
+    text = "".join(c for c in nfkd if not unicodedata.combining(c))
+    
+    # 2. Slovenská fonetická normalizácia (prepis cudzích/historických mien na fonetické slovenské ekvivalenty)
+    text = text.replace("cz", "c")     # Czauczika -> caucika (rovnako ako čaučika -> caucika)
+    text = text.replace("sch", "s")    # Greschika -> gresika (rovnako ako grešika -> gresika)
+    text = text.replace("y", "i")      # Zjednotenie i/y (Ruskynovský -> ruskinovski)
+    
+    # 3. Zjednotenie dvojitých hlások na jednu (Bottova -> botova, Hermann -> herman)
+    text = re.sub(r'([a-z])\1', r'\1', text)
+    
+    return text
 
 
 def similarity_score(a: str, b: str) -> float:
@@ -205,28 +220,108 @@ def classify_address_match(input_text: str, candidate_address: str, existing_sco
         }
 
 
+def clean_street_text(text: str) -> str:
+    """Odstráni všeobecné slová/predložky a ponechá len jedinečnú časť názvu ulice pre lepšie párovanie."""
+    normalized = _normalize(text)
+    words = normalized.split()
+    generics = {
+        "ulica", "cesta", "priechod", "riadok", "chodnik", 
+        "namestie", "sidlisko", "alej", "farma", "tunel", 
+        "odpocivadlo", "za", "pod", "nad", "pri", "na", 
+        "v", "s", "z", "do"
+    }
+    filtered = [w for w in words if w not in generics]
+    if not filtered:
+        # Ak by nezostalo nič (napr. dopyt bol len "Ulica"), vrátime pôvodné slová
+        filtered = words
+    return " ".join(filtered)
+
+
 def _street_score(query: str, street: str) -> tuple[int, int]:
-    """Vráti (primary_score, ratio) — primary uprednostňuje presnejšiu/kratšiu zhodu.
-    partial_ratio je penalizovaný 0.85x, aby kratší presný match vyhral nad substrinom.
+    """Vypočíta robustné skóre podobnosti založené na pokrytí tokenov (slov).
+    Zabraňuje chybnému priradeniu krátkych názvov (napr. Nová) pre dlhé dopyty s preklepmi.
     """
     q = _normalize(query)
     s = _normalize(street)
+    
+    if q == s:
+        return 100, 100
+        
+    qc = clean_street_text(query)
+    sc = clean_street_text(street)
+    
+    if qc == sc:
+        return 100, round(fuzz.ratio(q, s))
+        
     r = fuzz.ratio(q, s)
-    pr = fuzz.partial_ratio(q, s)
-    primary = round(max(r, pr * 0.85))
+    tsr = fuzz.token_sort_ratio(q, s)
+    tset = fuzz.token_set_ratio(q, s)
+    
+    r_clean = fuzz.ratio(qc, sc)
+    tsr_clean = fuzz.token_sort_ratio(qc, sc)
+    tset_clean = fuzz.token_set_ratio(qc, sc)
+    
+    q_tokens = qc.split()
+    s_tokens = sc.split()
+    
+    if not q_tokens or not s_tokens:
+        return round(max(r, tsr)), r
+        
+    # Výpočet zhody slov: ako dobre každé slovo z dopytu pasuje na nejaké slovo z ulice
+    q_matches = []
+    for qt in q_tokens:
+        best_val = 0
+        for st in s_tokens:
+            val = fuzz.ratio(qt, st)
+            if val > best_val:
+                best_val = val
+        q_matches.append(best_val)
+        
+    s_matches = []
+    for st in s_tokens:
+        best_val = 0
+        for qt in q_tokens:
+            val = fuzz.ratio(st, qt)
+            if val > best_val:
+                best_val = val
+        s_matches.append(best_val)
+        
+    q_cov = sum(q_matches) / len(q_matches)
+    
+    # Penalizácia za rozdiel v dĺžke (počte slov)
+    len_diff_penalty = 0.04 * max(0, len(s_tokens) - len(q_tokens))
+    partial_score = max(0.0, q_cov - len_diff_penalty * 100)
+    
+    primary = round(max(r, tsr, r_clean, tsr_clean, partial_score))
+    
+    # Ak je to veľmi kvalitný čiastočný match (napr. "Greschika" -> "Viktora Greschika")
+    if tset_clean >= 90 and q_cov >= 85:
+        primary = max(primary, round(q_cov))
+        
+    # Prvý a posledný znak ako tie-breaker/bonus pre vyčistené vlastné názvy
+    if primary >= 55 and qc and sc:
+        if qc[0] == sc[0]:
+            primary += 5
+        if qc[-1] == sc[-1]:
+            primary += 2
+            
+    primary = min(100, primary)
     return primary, r
 
 
 def _street_query_candidates(raw_address: str) -> list[str]:
-    """Build street-name candidates from an address without trusting the house number."""
+    """Vybuduje kandidátov názvu ulice. Odstráni orientačné číslo, len ak skutočne vyzerá ako číslo domu."""
+    import re
     address = raw_address.strip()
     if not address:
         return []
 
     candidates = []
-    parts = address.rsplit(maxsplit=1)
-    if len(parts) == 2:
-        candidates.append(parts[0])
+    # Regex pre detekciu čísla domu na konci dopytu (napr. "12", "12a", "1456/12", "12/B")
+    match = re.search(r'^(.*?)\s+(\d+[\w\-/]*)$', address)
+    if match:
+        candidates.append(match.group(1).strip())
+    
     candidates.append(address)
 
     cleaned = []
@@ -261,7 +356,22 @@ def _street_resolution(raw_address: str, streets: list[str]) -> dict:
     top = [item for item in ranked[:5] if item["score"] >= _STREET_MIN_SCORE]
     best = top[0] if top else None
     second = top[1] if len(top) > 1 else None
-    margin = best["score"] - second["score"] if best and second else 100
+    
+    if best and second:
+        if best["score"] == second["score"]:
+            # Ak je skóre očistených názvov zhodné, pozrieme sa na pomer neupravených názvov na rozuzlenie remízy.
+            # Ak zákazník explicitne povedal typ ulice (napr. "cesta" vs "ulica"), pomer neočistených slov
+            # bude výrazne vyšší pre správnu ulicu.
+            ratio_diff = best["ratio"] - second["ratio"]
+            if ratio_diff >= 10 and best["ratio"] >= 95:
+                margin = ratio_diff
+            else:
+                margin = 0
+        else:
+            margin = best["score"] - second["score"]
+    else:
+        margin = 100
+
     auto_accept = bool(
         best
         and best["score"] >= _STREET_AUTO_ACCEPT_SCORE
@@ -621,15 +731,20 @@ async def search_street(body: SearchStreetRequest):
     Fuzzy vyhladavanie ulice podla casti nazvu (STT vystup z ElevenLabs).
     Vrati found=True iba pri vysokej a jednoznacnej zhode.
     """
+    # Bezpecna inicializacia pre pripad predcasneho zlyhania
+    debug_info = None
+    original_query = body.query.strip() if hasattr(body, 'query') else ""
+    query = original_query
+    street_query = original_query
+    house_number = None
+    had_house_number = False
+
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
-
-    original_query = body.query.strip()
-    query = original_query
     
     import re
-    # Extrakcia cisla domu (ak konci na cislo s volitelnym pismenom, napr. "12A")
-    match = re.search(r'^(.*?)\s+([\d]+[a-zA-Z]?)$', query)
+    # Extrakcia cisla domu (ak konci na cislo s volitelnym pismenom, napr. "12A", "1456/12", "12/B")
+    match = re.search(r'^(.*?)\s+(\d+[\w\-/]*)$', query)
     if match:
         street_query = match.group(1).strip()
         house_number = match.group(2)
@@ -790,9 +905,9 @@ async def search_street(body: SearchStreetRequest):
                 and top2_score >= 75
                 and margin_score <= 4
                 and not is_significantly_shorter):
-                best_candidate["match_type"] = "ambiguous"
-                best_candidate["requires_confirmation"] = True
-                best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
+                    best_candidate["match_type"] = "ambiguous"
+                    best_candidate["requires_confirmation"] = True
+                    best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
 
         needs_confirmation = not resolution["auto_accept"] or best_candidate["requires_confirmation"]
         found = not needs_confirmation
@@ -841,9 +956,9 @@ async def search_street(body: SearchStreetRequest):
             "ok": False,
             "input": original_query,
             "query": original_query,
-            "street_query": street_query,
-            "house_number": house_number,
-            "had_house_number": had_house_number,
+            "street_query": street_query if 'street_query' in locals() else "",
+            "house_number": house_number if 'house_number' in locals() else None,
+            "had_house_number": had_house_number if 'had_house_number' in locals() else False,
             "full_address": None,
             "candidates": [],
             "selected_candidate": None,
@@ -855,7 +970,7 @@ async def search_street(body: SearchStreetRequest):
             "best_match": None,
             "message": "Nastala chyba pri vyhladavani adresy.",
             "suggestions": [],
-            "debug": debug_info
+            "debug": debug_info if ('debug_info' in locals() and debug_info is not None) else {}
         }
 
 # --- WHATSAPP LOGIKA (DOPLNOK) ---
