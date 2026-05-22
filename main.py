@@ -957,7 +957,6 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
     try:
         body = await request.json()
         print(f"[vytvor-objednavku] raw body: {body}")
-
         order = ManageOrder(**body)
     except Exception as e:
         print(f"[vytvor-objednavku] validacna chyba: {e}")
