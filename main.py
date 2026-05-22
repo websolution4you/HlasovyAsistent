@@ -101,6 +101,11 @@ class ManageOrder(BaseModel):
     transcript: Optional[str] = None
 
 
+class HumanFallbackRequest(BaseModel):
+    caller_number: Optional[str] = None
+    reason: Optional[str] = None
+
+
 ALLERGEN_MAP = {
     "1": "lepok", "2": "kôrovce", "3": "vajcia", "4": "ryby",
     "5": "arašidy", "6": "sója", "7": "mlieko", "8": "orechy",
@@ -901,7 +906,8 @@ async def send_whatsapp_message(to: str, message: str, template_sid: str = None,
                 auth=(twilio_account_sid, twilio_auth_token),
                 timeout=10.0
             )
-        print(f"[whatsapp] Twilio response: {resp.status_code} - {resp.text}")
+        if resp.status_code not in [200, 201]:
+            print(f"[whatsapp] CHYBA pri odosielani: {resp.status_code}")
         return resp.status_code in [200, 201]
     except Exception as e:
         print(f"[whatsapp] CHYBA: {e}")
@@ -910,6 +916,13 @@ async def send_whatsapp_message(to: str, message: str, template_sid: str = None,
 
 async def send_order_notifications_task(order_data: dict):
     """Spracuje a odosle notifikacie pre zakaznika aj restauraciu (len WhatsApp)."""
+    # PREPINAC NOTIFIKACII (Elegantne vypnutie/zapnutie cez Render)
+    ENABLE_WHATSAPP = os.getenv("ENABLE_WHATSAPP", "false").lower() == "true"
+    
+    if not ENABLE_WHATSAPP:
+        print(f"[notifikacie] WhatsApp je vypnutý (ENABLE_WHATSAPP=false).")
+        return
+
     # KONFIGURACIA SABLON
     TPL_CUSTOMER = os.getenv("TWILIO_TPL_CUSTOMER") 
     TPL_RESTAURANT = os.getenv("TWILIO_TPL_RESTAURANT")
@@ -932,7 +945,7 @@ async def send_order_notifications_task(order_data: dict):
         vars_cust = {"1": pizza, "2": address, "3": price}
         await send_whatsapp_message(phone, msg_cust, TPL_CUSTOMER, vars_cust)
     
-    print(f"[whatsapp] Notifikacie spracovane.")
+    print(f"[notifikacie] Objednávka {pizza} spracovaná.")
 
 
 @app.post("/api/vytvor-objednavku")
@@ -1002,6 +1015,65 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
         return {"status": "success", "message": "Objednavka uspesne zapisana."}
     except Exception as e:
         print(f"[vytvor-objednavku] CHYBA: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/request-human-fallback")
+async def request_human_fallback(request: Request):
+    """
+    ElevenLabs tool endpoint pre vyziadanie human fallback (spojenie s obsluhou).
+    Odosle WhatsApp notifikaciu restauracii.
+    """
+    try:
+        body = await request.json()
+        print(f"[fallback] raw body: {body}")
+        req_data = HumanFallbackRequest(**body)
+    except Exception as e:
+        print(f"[fallback] validacna chyba: {e}")
+        raise HTTPException(status_code=422, detail=str(e))
+
+    try:
+        # Ziskanie a normalizacia cisla zakaznika
+        caller_number = _normalize_phone(req_data.caller_number or body.get("caller_number") or "")
+        
+        if not caller_number or _is_twilio_owned_number(caller_number):
+            if _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
+                caller_number = _LAST_CALLER_PHONE
+            else:
+                caller_number = ""
+
+        reason = req_data.reason or "-"
+        print(f"[fallback] Vyziadana obsluha pre zakaznika '{caller_number}', dovod: '{reason}'")
+
+        # Zápis do Supabase tabuľky fallback_requests
+        try:
+            fallback_data = {
+                "tenant_id": TENANT_ID,
+                "customer_phone": caller_number,
+                "reason": reason,
+                "status": "NEW"
+            }
+            supabase.table("fallback_requests").insert(fallback_data).execute()
+            print(f"[fallback] Zápis do fallback_requests bol úspešný.")
+        except Exception as db_err:
+            print(f"[fallback] Varovanie: Zápis do DB zlyhal: {db_err}")
+
+        ENABLE_WHATSAPP = os.getenv("ENABLE_WHATSAPP", "false").lower() == "true"
+        if ENABLE_WHATSAPP:
+            RESTAURANT_PHONE = os.getenv("RESTAURANT_PHONE", "+421910922442")
+            TPL_RESTAURANT_FALLBACK = os.getenv("TWILIO_TPL_RESTAURANT_FALLBACK")
+            
+            msg_rest = f"⚠️ *ŽIADOSŤ O KONTAKT* \n\nZákazník na čísle {caller_number} žiada o rozhovor s obsluhou.\nDôvod: {reason}"
+            vars_rest = {"1": caller_number, "2": reason}
+            
+            await send_whatsapp_message(RESTAURANT_PHONE, msg_rest, TPL_RESTAURANT_FALLBACK, vars_rest)
+            print(f"[fallback] WhatsApp notifikacia odoslana restauracii.")
+        else:
+            print(f"[fallback] WhatsApp je vypnuty, neodosielam notifikaciu.")
+
+        return {"status": "success", "message": "Obsluha bola notifikovana."}
+    except Exception as e:
+        print(f"[fallback] CHYBA: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
