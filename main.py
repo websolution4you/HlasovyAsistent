@@ -1018,6 +1018,7 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
 
 
 @app.post("/api/request-human-fallback")
+@app.post("/api/request-human")
 async def request_human_fallback(request: Request):
     """
     ElevenLabs tool endpoint pre vyziadanie human fallback (spojenie s obsluhou).
