@@ -404,7 +404,7 @@ def _get_streets_cached(tenant_id: str) -> list[str]:
     if not supabase:
         raise Exception("Supabase klient nie je inicializovany")
 
-    result = supabase.table("streets").select("name").execute()
+    result = supabase.table("streets").select("name").limit(5000).execute()
     streets = [row["name"] for row in result.data] if result.data else []
     _STREETS_CACHE.update({"data": streets, "tenant_id": tenant_id, "timestamp": now})
     return streets
