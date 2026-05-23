@@ -1034,13 +1034,37 @@ async def request_human_fallback(request: Request):
 
     try:
         # Ziskanie a normalizacia cisla zakaznika
-        caller_number = _normalize_phone(req_data.caller_number or body.get("caller_number") or "")
+        raw_caller = req_data.caller_number or body.get("caller_number") or ""
         
-        if not caller_number or _is_twilio_owned_number(caller_number):
-            if _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
+        # Ak nam ElevenLabs poslal "unknown" alebo neplatne cislo (nema ziadne cislice),
+        # alebo ak je cislo prazdne ci patriace Twiliu, skusime ho ziskat inak:
+        normalized_caller = _normalize_phone(raw_caller)
+        is_invalid = (
+            not normalized_caller 
+            or "unknown" in normalized_caller.lower() 
+            or not any(c.isdigit() for c in normalized_caller)
+            or _is_twilio_owned_number(normalized_caller)
+        )
+        
+        if is_invalid:
+            # 1. Skusime vytiahnut z dynamic_variables od ElevenLabs (ak su pritomne)
+            dyn_vars = body.get("dynamic_variables", {})
+            el_caller = _normalize_phone(dyn_vars.get("caller_number") or dyn_vars.get("from_number") or "")
+            
+            if (
+                el_caller 
+                and not _is_twilio_owned_number(el_caller) 
+                and "unknown" not in el_caller.lower() 
+                and any(c.isdigit() for c in el_caller)
+            ):
+                caller_number = el_caller
+            # 2. Ak nemame cislo z dynamic_variables, pouzijeme globalny _LAST_CALLER_PHONE
+            elif _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
                 caller_number = _LAST_CALLER_PHONE
             else:
                 caller_number = ""
+        else:
+            caller_number = normalized_caller
 
         reason = req_data.reason or "-"
         print(f"[fallback] Vyziadana obsluha pre zakaznika '{caller_number}', dovod: '{reason}'")
