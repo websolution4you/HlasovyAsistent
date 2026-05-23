@@ -1025,9 +1025,11 @@ async def send_whatsapp_message(to: str, message: str, template_sid: str = None,
 
 async def send_order_notifications_task(order_data: dict):
     """Spracuje a odosle notifikacie pre zakaznika aj restauraciu (len WhatsApp)."""
-    enable_whatsapp = os.getenv("ENABLE_WHATSAPP", "true").lower() in ("true", "1", "yes")
-    if not enable_whatsapp:
-        print("[whatsapp] Odosielanie notifikácií je vypnuté (ENABLE_WHATSAPP=false).")
+    # PREPINAC NOTIFIKACII (Elegantne vypnutie/zapnutie cez Render)
+    ENABLE_WHATSAPP = os.getenv("ENABLE_WHATSAPP", "false").lower() == "true"
+    
+    if not ENABLE_WHATSAPP:
+        print(f"[notifikacie] WhatsApp je vypnutý (ENABLE_WHATSAPP=false).")
         return
     # KONFIGURACIA SABLON
     TPL_CUSTOMER = os.getenv("TWILIO_TPL_CUSTOMER") 
