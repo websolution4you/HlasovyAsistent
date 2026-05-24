@@ -850,6 +850,7 @@ async def search_street(body: SearchStreetRequest):
     }
     
     candidates = []
+    top_old_style = [{"street": item["street"], "score": item["score"]} for item in resolution["suggestions"]]
     
             # Vybuduj zoznam candidates v pozadovanom formate
     for item in resolution["suggestions"]:
@@ -863,8 +864,6 @@ async def search_street(body: SearchStreetRequest):
             "reason": classification["reason"]
         }
         candidates.append(candidate)
-        
-        top_old_style = [{"street": item["street"], "score": item["score"]} for item in resolution["suggestions"]]
 
     print(f"[search-street] top_results={top_old_style} margin={resolution['margin']} auto_accept={resolution['auto_accept']}")
 
