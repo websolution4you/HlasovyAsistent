@@ -924,6 +924,9 @@ async def search_street(body: SearchStreetRequest):
                     best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
 
         needs_confirmation = not resolution["auto_accept"]
+        if not needs_confirmation and best_candidate["match_type"] != "ambiguous":
+            best_candidate["requires_confirmation"] = False
+
         found = not needs_confirmation
         best_match = top_old_style[0]["street"] if top_old_style else None
         confidence = top_old_style[0]["score"] if top_old_style else 0
