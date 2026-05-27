@@ -117,7 +117,7 @@ ALLERGEN_MAP = {
 
 _STREETS_CACHE: dict = {"data": [], "tenant_id": "", "timestamp": 0.0}
 _STREET_MIN_SCORE = 60
-_STREET_AUTO_ACCEPT_SCORE = 85
+_STREET_AUTO_ACCEPT_SCORE = 75
 _STREET_AUTO_ACCEPT_MARGIN = 5
 _CACHE_TTL = 300  # 5 minút
 
