@@ -465,8 +465,56 @@ def health_config():
             "tenant_id_present": bool(TENANT_ID),
             "supabase_client_ready": supabase is not None,
             "cors_allow_origins": CORS_ALLOW_ORIGINS,
+            "twilio_account_sid_present": bool(os.getenv("TWILIO_ACCOUNT_SID")),
+            "twilio_auth_token_present": bool(os.getenv("TWILIO_AUTH_TOKEN")),
+            "twilio_api_key_present": bool(os.getenv("TWILIO_API_KEY")),
+            "twilio_api_secret_present": bool(os.getenv("TWILIO_API_SECRET")),
+            "twiml_app_sid_present": bool(os.getenv("TWIML_APP_SID")),
         },
     }
+
+
+@app.get("/twilio/token")
+def get_twilio_token():
+    """
+    Generuje Twilio Access Token pre WebRTC klientov.
+    """
+    import uuid
+    from twilio.jwt.access_token import AccessToken
+    from twilio.jwt.access_token.grants import VoiceGrant
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    api_key = os.getenv("TWILIO_API_KEY", "").strip()
+    api_secret = os.getenv("TWILIO_API_SECRET", "").strip()
+    twiml_app_sid = os.getenv("TWIML_APP_SID", "").strip()
+
+    if not account_sid or not api_key or not api_secret or not twiml_app_sid:
+        missing = []
+        if not account_sid: missing.append("TWILIO_ACCOUNT_SID")
+        if not api_key: missing.append("TWILIO_API_KEY")
+        if not api_secret: missing.append("TWILIO_API_SECRET")
+        if not twiml_app_sid: missing.append("TWIML_APP_SID")
+        print(f"[twilio/token] Chyba konfiguracie: nepritomne {', '.join(missing)}")
+        raise HTTPException(status_code=500, detail=f"Chyba konfiguracie: nepritomne {', '.join(missing)}")
+
+    try:
+        identity = f"web-user-{uuid.uuid4().hex[:7]}"
+        token = AccessToken(
+            account_sid,
+            api_key,
+            api_secret,
+            identity=identity,
+            ttl=3600
+        )
+        grant = VoiceGrant(
+            outgoing_application_sid=twiml_app_sid,
+            incoming_allow=False
+        )
+        token.add_grant(grant)
+        return {"token": token.to_jwt(), "identity": identity}
+    except Exception as e:
+        print(f"[twilio/token] Chyba pri generovani tokenu: {e}")
+        raise HTTPException(status_code=500, detail=f"Chyba pri generovani tokenu: {str(e)}")
 
 
 @app.api_route("/twilio/incoming", methods=["GET", "POST"])
