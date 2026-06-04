@@ -1,6 +1,7 @@
 import os
 import time
 import unicodedata
+from difflib import SequenceMatcher
 from html import escape as xml_escape
 from rapidfuzz import fuzz
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
@@ -101,6 +102,11 @@ class ManageOrder(BaseModel):
     transcript: Optional[str] = None
 
 
+class HumanFallbackRequest(BaseModel):
+    caller_number: Optional[str] = None
+    reason: Optional[str] = None
+
+
 ALLERGEN_MAP = {
     "1": "lepok", "2": "kôrovce", "3": "vajcia", "4": "ryby",
     "5": "arašidy", "6": "sója", "7": "mlieko", "8": "orechy",
@@ -111,7 +117,7 @@ ALLERGEN_MAP = {
 
 _STREETS_CACHE: dict = {"data": [], "tenant_id": "", "timestamp": 0.0}
 _STREET_MIN_SCORE = 60
-_STREET_AUTO_ACCEPT_SCORE = 90
+_STREET_AUTO_ACCEPT_SCORE = 75
 _STREET_AUTO_ACCEPT_MARGIN = 5
 _CACHE_TTL = 300  # 5 minút
 
@@ -153,9 +159,23 @@ def _first_customer_phone_candidate(*phones: str) -> str:
 
 
 def _normalize(s: str) -> str:
-    """Lowercase + odstránenie diakritiky."""
+    """Lowercase + odstránenie diakritiky + slovensko-fonetická normalizácia pre hlasových asistentov."""
+    if not s:
+        return ""
+    import re
+    # 1. Odstránenie diakritiky
     nfkd = unicodedata.normalize("NFD", s.lower().strip())
-    return "".join(c for c in nfkd if not unicodedata.combining(c))
+    text = "".join(c for c in nfkd if not unicodedata.combining(c))
+    
+    # 2. Slovenská fonetická normalizácia (prepis cudzích/historických mien na fonetické slovenské ekvivalenty)
+    text = text.replace("cz", "c")     # Czauczika -> caucika (rovnako ako čaučika -> caucika)
+    text = text.replace("sch", "s")    # Greschika -> gresika (rovnako ako grešika -> gresika)
+    text = text.replace("y", "i")      # Zjednotenie i/y (Ruskynovský -> ruskinovski)
+    
+    # 3. Zjednotenie dvojitých hlások na jednu (Bottova -> botova, Hermann -> herman)
+    text = re.sub(r'([a-z])\1', r'\1', text)
+    
+    return text
 
 
 def similarity_score(a: str, b: str) -> float:
@@ -205,28 +225,108 @@ def classify_address_match(input_text: str, candidate_address: str, existing_sco
         }
 
 
+def clean_street_text(text: str) -> str:
+    """Odstráni všeobecné slová/predložky a ponechá len jedinečnú časť názvu ulice pre lepšie párovanie."""
+    normalized = _normalize(text)
+    words = normalized.split()
+    generics = {
+        "ulica", "cesta", "priechod", "riadok", "chodnik", 
+        "namestie", "sidlisko", "alej", "farma", "tunel", 
+        "odpocivadlo", "za", "pod", "nad", "pri", "na", 
+        "v", "s", "z", "do"
+    }
+    filtered = [w for w in words if w not in generics]
+    if not filtered:
+        # Ak by nezostalo nič (napr. dopyt bol len "Ulica"), vrátime pôvodné slová
+        filtered = words
+    return " ".join(filtered)
+
+
 def _street_score(query: str, street: str) -> tuple[int, int]:
-    """Vráti (primary_score, ratio) — primary uprednostňuje presnejšiu/kratšiu zhodu.
-    partial_ratio je penalizovaný 0.85x, aby kratší presný match vyhral nad substrinom.
+    """Vypočíta robustné skóre podobnosti založené na pokrytí tokenov (slov).
+    Zabraňuje chybnému priradeniu krátkych názvov (napr. Nová) pre dlhé dopyty s preklepmi.
     """
     q = _normalize(query)
     s = _normalize(street)
+    
+    if q == s:
+        return 100, 100
+        
+    qc = clean_street_text(query)
+    sc = clean_street_text(street)
+    
+    if qc == sc:
+        return 100, round(fuzz.ratio(q, s))
+        
     r = fuzz.ratio(q, s)
-    pr = fuzz.partial_ratio(q, s)
-    primary = round(max(r, pr * 0.85))
+    tsr = fuzz.token_sort_ratio(q, s)
+    tset = fuzz.token_set_ratio(q, s)
+    
+    r_clean = fuzz.ratio(qc, sc)
+    tsr_clean = fuzz.token_sort_ratio(qc, sc)
+    tset_clean = fuzz.token_set_ratio(qc, sc)
+    
+    q_tokens = qc.split()
+    s_tokens = sc.split()
+    
+    if not q_tokens or not s_tokens:
+        return round(max(r, tsr)), r
+        
+    # Výpočet zhody slov: ako dobre každé slovo z dopytu pasuje na nejaké slovo z ulice
+    q_matches = []
+    for qt in q_tokens:
+        best_val = 0
+        for st in s_tokens:
+            val = fuzz.ratio(qt, st)
+            if val > best_val:
+                best_val = val
+        q_matches.append(best_val)
+        
+    s_matches = []
+    for st in s_tokens:
+        best_val = 0
+        for qt in q_tokens:
+            val = fuzz.ratio(st, qt)
+            if val > best_val:
+                best_val = val
+        s_matches.append(best_val)
+        
+    q_cov = sum(q_matches) / len(q_matches)
+    
+    # Penalizácia za rozdiel v dĺžke (počte slov)
+    len_diff_penalty = 0.04 * max(0, len(s_tokens) - len(q_tokens))
+    partial_score = max(0.0, q_cov - len_diff_penalty * 100)
+    
+    primary = round(max(r, tsr, r_clean, tsr_clean, partial_score))
+    
+    # Ak je to veľmi kvalitný čiastočný match (napr. "Greschika" -> "Viktora Greschika")
+    if tset_clean >= 90 and q_cov >= 85:
+        primary = max(primary, round(q_cov))
+        
+    # Prvý a posledný znak ako tie-breaker/bonus pre vyčistené vlastné názvy
+    if primary >= 55 and qc and sc:
+        if qc[0] == sc[0]:
+            primary += 5
+        if qc[-1] == sc[-1]:
+            primary += 2
+            
+    primary = min(100, primary)
     return primary, r
 
 
 def _street_query_candidates(raw_address: str) -> list[str]:
-    """Build street-name candidates from an address without trusting the house number."""
+    """Vybuduje kandidátov názvu ulice. Odstráni orientačné číslo, len ak skutočne vyzerá ako číslo domu."""
+    import re
     address = raw_address.strip()
     if not address:
         return []
 
     candidates = []
-    parts = address.rsplit(maxsplit=1)
-    if len(parts) == 2:
-        candidates.append(parts[0])
+    # Regex pre detekciu čísla domu na konci dopytu (napr. "12", "12a", "1456/12", "12/B")
+    match = re.search(r'^(.*?)\s+(\d+[\w\-/]*)$', address)
+    if match:
+        candidates.append(match.group(1).strip())
+    
     candidates.append(address)
 
     cleaned = []
@@ -261,7 +361,22 @@ def _street_resolution(raw_address: str, streets: list[str]) -> dict:
     top = [item for item in ranked[:5] if item["score"] >= _STREET_MIN_SCORE]
     best = top[0] if top else None
     second = top[1] if len(top) > 1 else None
-    margin = best["score"] - second["score"] if best and second else 100
+    
+    if best and second:
+        if best["score"] == second["score"]:
+            # Ak je skóre očistených názvov zhodné, pozrieme sa na pomer neupravených názvov na rozuzlenie remízy.
+            # Ak zákazník explicitne povedal typ ulice (napr. "cesta" vs "ulica"), pomer neočistených slov
+            # bude výrazne vyšší pre správnu ulicu.
+            ratio_diff = best["ratio"] - second["ratio"]
+            if ratio_diff >= 10 and best["ratio"] >= 95:
+                margin = ratio_diff
+            else:
+                margin = 0
+        else:
+            margin = best["score"] - second["score"]
+    else:
+        margin = 100
+
     auto_accept = bool(
         best
         and best["score"] >= _STREET_AUTO_ACCEPT_SCORE
@@ -289,8 +404,18 @@ def _get_streets_cached(tenant_id: str) -> list[str]:
     if not supabase:
         raise Exception("Supabase klient nie je inicializovany")
 
-    result = supabase.table("streets").select("name").execute()
-    streets = [row["name"] for row in result.data] if result.data else []
+    streets = []
+    start = 0
+    page_size = 1000
+    while True:
+        result = supabase.table("streets").select("name").range(start, start + page_size - 1).execute()
+        if not result.data:
+            break
+        streets.extend([row["name"] for row in result.data])
+        if len(result.data) < page_size:
+            break
+        start += page_size
+
     _STREETS_CACHE.update({"data": streets, "tenant_id": tenant_id, "timestamp": now})
     return streets
 
@@ -669,15 +794,20 @@ async def search_street(body: SearchStreetRequest):
     Fuzzy vyhladavanie ulice podla casti nazvu (STT vystup z ElevenLabs).
     Vrati found=True iba pri vysokej a jednoznacnej zhode.
     """
+    # Bezpecna inicializacia pre pripad predcasneho zlyhania
+    debug_info = None
+    original_query = body.query.strip() if hasattr(body, 'query') else ""
+    query = original_query
+    street_query = original_query
+    house_number = None
+    had_house_number = False
+
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase klient nie je inicializovany.")
-
-    original_query = body.query.strip()
-    query = original_query
     
     import re
-    # Extrakcia cisla domu (ak konci na cislo s volitelnym pismenom, napr. "12A")
-    match = re.search(r'^(.*?)\s+([\d]+[a-zA-Z]?)$', query)
+    # Extrakcia cisla domu (ak konci na cislo s volitelnym pismenom, napr. "12A", "1456/12", "12/B")
+    match = re.search(r'^(.*?)\s+(\d+[\w\-/]*)$', query)
     if match:
         street_query = match.group(1).strip()
         house_number = match.group(2)
@@ -768,6 +898,7 @@ async def search_street(body: SearchStreetRequest):
     }
     
     candidates = []
+    top_old_style = [{"street": item["street"], "score": item["score"]} for item in resolution["suggestions"]]
     
             # Vybuduj zoznam candidates v pozadovanom formate
     for item in resolution["suggestions"]:
@@ -781,8 +912,6 @@ async def search_street(body: SearchStreetRequest):
             "reason": classification["reason"]
         }
         candidates.append(candidate)
-        
-        top_old_style = [{"street": item["street"], "score": item["score"]} for item in resolution["suggestions"]]
 
     print(f"[search-street] top_results={top_old_style} margin={resolution['margin']} auto_accept={resolution['auto_accept']}")
 
@@ -838,11 +967,14 @@ async def search_street(body: SearchStreetRequest):
                 and top2_score >= 75
                 and margin_score <= 4
                 and not is_significantly_shorter):
-                best_candidate["match_type"] = "ambiguous"
-                best_candidate["requires_confirmation"] = True
-                best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
+                    best_candidate["match_type"] = "ambiguous"
+                    best_candidate["requires_confirmation"] = True
+                    best_candidate["reason"] = "Nájdených viacero podobných možností, nutné upresniť."
 
-        needs_confirmation = not resolution["auto_accept"] or best_candidate["requires_confirmation"]
+        needs_confirmation = not resolution["auto_accept"]
+        if not needs_confirmation and best_candidate["match_type"] != "ambiguous":
+            best_candidate["requires_confirmation"] = False
+
         found = not needs_confirmation
         best_match = top_old_style[0]["street"] if top_old_style else None
         confidence = top_old_style[0]["score"] if top_old_style else 0
@@ -889,9 +1021,9 @@ async def search_street(body: SearchStreetRequest):
             "ok": False,
             "input": original_query,
             "query": original_query,
-            "street_query": street_query,
-            "house_number": house_number,
-            "had_house_number": had_house_number,
+            "street_query": street_query if 'street_query' in locals() else "",
+            "house_number": house_number if 'house_number' in locals() else None,
+            "had_house_number": had_house_number if 'had_house_number' in locals() else False,
             "full_address": None,
             "candidates": [],
             "selected_candidate": None,
@@ -903,7 +1035,7 @@ async def search_street(body: SearchStreetRequest):
             "best_match": None,
             "message": "Nastala chyba pri vyhladavani adresy.",
             "suggestions": [],
-            "debug": debug_info
+            "debug": debug_info if ('debug_info' in locals() and debug_info is not None) else {}
         }
 
 # --- WHATSAPP LOGIKA (DOPLNOK) ---
@@ -949,7 +1081,8 @@ async def send_whatsapp_message(to: str, message: str, template_sid: str = None,
                 auth=(twilio_account_sid, twilio_auth_token),
                 timeout=10.0
             )
-        print(f"[whatsapp] Twilio response: {resp.status_code} - {resp.text}")
+        if resp.status_code not in [200, 201]:
+            print(f"[whatsapp] CHYBA pri odosielani: {resp.status_code}")
         return resp.status_code in [200, 201]
     except Exception as e:
         print(f"[whatsapp] CHYBA: {e}")
@@ -958,6 +1091,12 @@ async def send_whatsapp_message(to: str, message: str, template_sid: str = None,
 
 async def send_order_notifications_task(order_data: dict):
     """Spracuje a odosle notifikacie pre zakaznika aj restauraciu (len WhatsApp)."""
+    # PREPINAC NOTIFIKACII (Elegantne vypnutie/zapnutie cez Render)
+    ENABLE_WHATSAPP = os.getenv("ENABLE_WHATSAPP", "false").lower() == "true"
+    
+    if not ENABLE_WHATSAPP:
+        print(f"[notifikacie] WhatsApp je vypnutý (ENABLE_WHATSAPP=false).")
+        return
     # KONFIGURACIA SABLON
     TPL_CUSTOMER = os.getenv("TWILIO_TPL_CUSTOMER") 
     TPL_RESTAURANT = os.getenv("TWILIO_TPL_RESTAURANT")
@@ -980,7 +1119,7 @@ async def send_order_notifications_task(order_data: dict):
         vars_cust = {"1": pizza, "2": address, "3": price}
         await send_whatsapp_message(phone, msg_cust, TPL_CUSTOMER, vars_cust)
     
-    print(f"[whatsapp] Notifikacie spracovane.")
+    print(f"[notifikacie] Objednávka {pizza} spracovaná.")
 
 
 @app.post("/api/vytvor-objednavku")
@@ -992,7 +1131,6 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
     try:
         body = await request.json()
         print(f"[vytvor-objednavku] raw body: {body}")
-
         order = ManageOrder(**body)
     except Exception as e:
         print(f"[vytvor-objednavku] validacna chyba: {e}")
@@ -1050,6 +1188,90 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
         return {"status": "success", "message": "Objednavka uspesne zapisana."}
     except Exception as e:
         print(f"[vytvor-objednavku] CHYBA: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/request-human-fallback")
+@app.post("/api/request-human")
+async def request_human_fallback(request: Request):
+    """
+    ElevenLabs tool endpoint pre vyziadanie human fallback (spojenie s obsluhou).
+    Odosle WhatsApp notifikaciu restauracii.
+    """
+    try:
+        body = await request.json()
+        print(f"[fallback] raw body: {body}")
+        req_data = HumanFallbackRequest(**body)
+    except Exception as e:
+        print(f"[fallback] validacna chyba: {e}")
+        raise HTTPException(status_code=422, detail=str(e))
+
+    try:
+        # Ziskanie a normalizacia cisla zakaznika
+        raw_caller = req_data.caller_number or body.get("caller_number") or ""
+        
+        # Ak nam ElevenLabs poslal "unknown" alebo neplatne cislo (nema ziadne cislice),
+        # alebo ak je cislo prazdne ci patriace Twiliu, skusime ho ziskat inak:
+        normalized_caller = _normalize_phone(raw_caller)
+        is_invalid = (
+            not normalized_caller 
+            or "unknown" in normalized_caller.lower() 
+            or not any(c.isdigit() for c in normalized_caller)
+            or _is_twilio_owned_number(normalized_caller)
+        )
+        
+        if is_invalid:
+            # 1. Skusime vytiahnut z dynamic_variables od ElevenLabs (ak su pritomne)
+            dyn_vars = body.get("dynamic_variables", {})
+            el_caller = _normalize_phone(dyn_vars.get("caller_number") or dyn_vars.get("from_number") or "")
+            
+            if (
+                el_caller 
+                and not _is_twilio_owned_number(el_caller) 
+                and "unknown" not in el_caller.lower() 
+                and any(c.isdigit() for c in el_caller)
+            ):
+                caller_number = el_caller
+            # 2. Ak nemame cislo z dynamic_variables, pouzijeme globalny _LAST_CALLER_PHONE
+            elif _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
+                caller_number = _LAST_CALLER_PHONE
+            else:
+                caller_number = ""
+        else:
+            caller_number = normalized_caller
+
+        reason = req_data.reason or "-"
+        print(f"[fallback] Vyziadana obsluha pre zakaznika '{caller_number}', dovod: '{reason}'")
+
+        # Zápis do Supabase tabuľky fallback_requests
+        try:
+            fallback_data = {
+                "tenant_id": TENANT_ID,
+                "customer_phone": caller_number,
+                "reason": reason,
+                "status": "NEW"
+            }
+            supabase.table("fallback_requests").insert(fallback_data).execute()
+            print(f"[fallback] Zápis do fallback_requests bol úspešný.")
+        except Exception as db_err:
+            print(f"[fallback] Varovanie: Zápis do DB zlyhal: {db_err}")
+
+        ENABLE_WHATSAPP = os.getenv("ENABLE_WHATSAPP", "false").lower() == "true"
+        if ENABLE_WHATSAPP:
+            RESTAURANT_PHONE = os.getenv("RESTAURANT_PHONE", "+421910922442")
+            TPL_RESTAURANT_FALLBACK = os.getenv("TWILIO_TPL_RESTAURANT_FALLBACK")
+            
+            msg_rest = f"⚠️ *ŽIADOSŤ O KONTAKT* \n\nZákazník na čísle {caller_number} žiada o rozhovor s obsluhou.\nDôvod: {reason}"
+            vars_rest = {"1": caller_number, "2": reason}
+            
+            await send_whatsapp_message(RESTAURANT_PHONE, msg_rest, TPL_RESTAURANT_FALLBACK, vars_rest)
+            print(f"[fallback] WhatsApp notifikacia odoslana restauracii.")
+        else:
+            print(f"[fallback] WhatsApp je vypnuty, neodosielam notifikaciu.")
+
+        return {"status": "success", "message": "Obsluha bola notifikovana."}
+    except Exception as e:
+        print(f"[fallback] CHYBA: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
