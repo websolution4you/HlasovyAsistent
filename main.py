@@ -30,11 +30,15 @@ def _parse_cors_origins() -> list[str]:
     """
     raw = os.getenv(
         "CORS_ALLOW_ORIGINS",
-        "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173,https://telio.sk,https://www.telio.sk",
+        "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173",
     ).strip()
     if raw == "*":
         return ["*"]
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    for extra in ["https://telio.sk", "https://www.telio.sk"]:
+        if extra not in origins:
+            origins.append(extra)
+    return origins
 
 
 CORS_ALLOW_ORIGINS = _parse_cors_origins()
