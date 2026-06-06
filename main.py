@@ -746,7 +746,23 @@ async def twilio_voice_webhook(request: Request):
 
     # 4. ELEVENLABS REGISTER CALL -> HOTOVE TWIML PRE TWILIO
     try:
-        from elevenlabs import ElevenLabs
+        # Get current time and date in Slovak timezone (Europe/Bratislava)
+        import zoneinfo
+        from datetime import datetime
+        
+        try:
+            tz = zoneinfo.ZoneInfo("Europe/Bratislava")
+            now = datetime.now(tz)
+        except Exception:
+            # Fallback if timezone data is missing
+            from datetime import timezone, timedelta
+            tz = timezone(timedelta(hours=2)) # default to UTC+2 for Slovak time (CEST)
+            now = datetime.now(tz)
+
+        slovak_days = ["pondelok", "utorok", "streda", "štvrtok", "piatok", "sobota", "nedeľa"]
+        current_day = slovak_days[now.weekday()]
+        current_time = now.strftime("%H:%M")
+        current_date = now.strftime("%d.%m.%Y")
 
         client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
         twiml = client.conversational_ai.twilio.register_call(
@@ -761,10 +777,13 @@ async def twilio_voice_webhook(request: Request):
                     "from_number": from_number,
                     "to_number": to_number,
                     "call_sid": call_sid,
+                    "current_day": current_day,
+                    "current_time": current_time,
+                    "current_date": current_date,
                 }
             },
         )
-        print("[twilio/voice] ElevenLabs register_call OK, vraciam TwiML Twiliu")
+        print(f"[twilio/voice] ElevenLabs register_call OK (day={current_day}, time={current_time}, date={current_date}), vraciam TwiML Twiliu")
         return Response(content=twiml, media_type="application/xml")
     except Exception as e:
         print(f"[twilio/voice] ElevenLabs register_call zlyhal: {e}")
@@ -799,12 +818,31 @@ async def twilio_status_webhook(request: Request):
 async def prompt_config():
     """
     ElevenLabs Server URL endpoint — volá sa pred každým hovorom.
-    Vracia dynamic_variables s aktuálnym menu z DB.
+    Vracia dynamic_variables s aktuálnym menu z DB a časovými údajmi.
     """
+    import zoneinfo
+    from datetime import datetime
+    
+    try:
+        tz = zoneinfo.ZoneInfo("Europe/Bratislava")
+        now = datetime.now(tz)
+    except Exception:
+        from datetime import timezone, timedelta
+        tz = timezone(timedelta(hours=2))
+        now = datetime.now(tz)
+
+    slovak_days = ["pondelok", "utorok", "streda", "štvrtok", "piatok", "sobota", "nedeľa"]
+    current_day = slovak_days[now.weekday()]
+    current_time = now.strftime("%H:%M")
+    current_date = now.strftime("%d.%m.%Y")
+
     menu_text = format_menu_from_db(TENANT_ID)
     return {
         "dynamic_variables": {
             "menu": menu_text if menu_text else "Menu nie je momentálne dostupné.",
+            "current_day": current_day,
+            "current_time": current_time,
+            "current_date": current_date,
         }
     }
 
