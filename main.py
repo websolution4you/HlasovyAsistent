@@ -18,6 +18,9 @@ load_dotenv()
 # --- ELEVENLABS KONFIGURÁCIA ---
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
 ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "").strip()
+ELEVENLABS_AGENT_ID_PIZZA = os.getenv("ELEVENLABS_AGENT_ID_PIZZA", "").strip()
+ELEVENLABS_AGENT_ID_CLINIC = os.getenv("ELEVENLABS_AGENT_ID_CLINIC", "").strip()
+ELEVENLABS_AGENT_ID_TAXI = os.getenv("ELEVENLABS_AGENT_ID_TAXI", "").strip()
 
 app = FastAPI(title="ElevenLabs Pizza Webhook")
 
@@ -80,6 +83,9 @@ print(f"CORE_SUPABASE_SERVICE_ROLE_KEY nastavene: {'ano' if bool(SUPABASE_KEY) e
 print(f"TENANT_ID nastavene: {'ano' if bool(TENANT_ID) else 'nie'}")
 print(f"ELEVENLABS_API_KEY nastavene: {'ano' if bool(ELEVENLABS_API_KEY) else 'nie'}")
 print(f"ELEVENLABS_AGENT_ID nastavene: {'ano' if bool(ELEVENLABS_AGENT_ID) else 'nie'}")
+print(f"ELEVENLABS_AGENT_ID_PIZZA nastavene: {'ano' if bool(ELEVENLABS_AGENT_ID_PIZZA) else 'nie'}")
+print(f"ELEVENLABS_AGENT_ID_CLINIC nastavene: {'ano' if bool(ELEVENLABS_AGENT_ID_CLINIC) else 'nie'}")
+print(f"ELEVENLABS_AGENT_ID_TAXI nastavene: {'ano' if bool(ELEVENLABS_AGENT_ID_TAXI) else 'nie'}")
 print(f"CORS_ALLOW_ORIGINS: {CORS_ALLOW_ORIGINS}")
 print("----------------------")
 
@@ -599,6 +605,9 @@ def health_config():
             "twilio_api_key_present": bool(os.getenv("TWILIO_API_KEY")),
             "twilio_api_secret_present": bool(os.getenv("TWILIO_API_SECRET")),
             "twiml_app_sid_present": bool(os.getenv("TWIML_APP_SID")),
+            "elevenlabs_agent_id_pizza_present": bool(ELEVENLABS_AGENT_ID_PIZZA),
+            "elevenlabs_agent_id_clinic_present": bool(ELEVENLABS_AGENT_ID_CLINIC),
+            "elevenlabs_agent_id_taxi_present": bool(ELEVENLABS_AGENT_ID_TAXI),
         },
     }
 
@@ -693,7 +702,13 @@ async def twilio_voice_webhook(request: Request):
             TWILIO_NUMBER_CONTEXT.add(called_number)
         customer_number = _first_customer_phone_candidate(from_number, caller_number)
         print(f"[twilio/voice] raw Twilio payload: {twilio_payload}")
-        print(f"[twilio/voice] Inbound call: from={from_number}, caller={caller_number}, to={to_number}, called={called_number}, call_sid={call_sid}, resolved_customer={customer_number}")
+        business_type = (
+            form_data.get("business_type") 
+            or form_data.get("businessType") 
+            or ""
+        ).strip().lower()
+
+        print(f"[twilio/voice] Inbound call: from={from_number}, caller={caller_number}, to={to_number}, called={called_number}, call_sid={call_sid}, resolved_customer={customer_number}, business_type={business_type}")
         if customer_number:
             global _LAST_CALLER_PHONE
             _LAST_CALLER_PHONE = customer_number
@@ -710,6 +725,18 @@ async def twilio_voice_webhook(request: Request):
         to_number = ""
         called_number = ""
         call_sid = ""
+        business_type = ""
+
+    # Resolve specific ElevenLabs Agent ID
+    agent_id = ELEVENLABS_AGENT_ID
+    if business_type == "pizza":
+        agent_id = ELEVENLABS_AGENT_ID_PIZZA or ELEVENLABS_AGENT_ID
+    elif business_type == "clinic":
+        agent_id = ELEVENLABS_AGENT_ID_CLINIC or ELEVENLABS_AGENT_ID
+    elif business_type == "taxi":
+        agent_id = ELEVENLABS_AGENT_ID_TAXI or ELEVENLABS_AGENT_ID
+
+    print(f"[twilio/voice] Selected ElevenLabs Agent ID: {agent_id} for business_type: '{business_type}'")
 
     # 3. MENU Z DB -> DYNAMIC VARIABLE
     menu = format_menu_from_db(TENANT_ID)
@@ -723,7 +750,7 @@ async def twilio_voice_webhook(request: Request):
 
         client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
         twiml = client.conversational_ai.twilio.register_call(
-            agent_id=ELEVENLABS_AGENT_ID,
+            agent_id=agent_id,
             from_number=from_number,
             to_number=to_number,
             direction="inbound",
