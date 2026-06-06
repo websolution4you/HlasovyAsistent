@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from typing import Optional
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from elevenlabs import ElevenLabs
 
 # Nacitanie environment premennych (uzitocne pre lokalny vyvoj)
 load_dotenv()
@@ -503,8 +504,9 @@ async def _check_systems() -> tuple[bool, str]:
     if not ELEVENLABS_API_KEY:
         print("[check_systems] FAIL: ELEVENLABS_API_KEY chyba")
         return False, "Chyba ELEVENLABS_API_KEY"
-    if not ELEVENLABS_AGENT_ID:
-        print("[check_systems] FAIL: ELEVENLABS_AGENT_ID chyba")
+    has_any_agent = any([ELEVENLABS_AGENT_ID, ELEVENLABS_AGENT_ID_PIZZA, ELEVENLABS_AGENT_ID_CLINIC, ELEVENLABS_AGENT_ID_TAXI])
+    if not has_any_agent:
+        print("[check_systems] FAIL: Ziadny ELEVENLABS_AGENT_ID nie je nastaveny")
         return False, "Chyba ELEVENLABS_AGENT_ID"
     print("[check_systems] Vsetko OK")
     return True, "OK"
