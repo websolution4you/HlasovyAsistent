@@ -58,6 +58,7 @@ SUPABASE_URL = os.getenv("CORE_SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("CORE_SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 TENANT_ID = os.getenv("TENANT_ID", "").strip()
+NTC_TENANT_ID = os.getenv("NTC_TENANT_ID", "595cbb6c-1019-41ae-b1c2-a60c13c8dcdf").strip()
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("--- CHYBA KONFIGURACIE ---")
@@ -105,6 +106,23 @@ class ManageOrder(BaseModel):
 class HumanFallbackRequest(BaseModel):
     caller_number: Optional[str] = None
     reason: Optional[str] = None
+
+
+class CheckAvailabilityRequest(BaseModel):
+    sport: str  # e.g., "badminton", "squash", "tennis", "tennis-clay"
+    start_time_iso: str  # e.g., "2026-06-21T10:00:00"
+    duration_minutes: Optional[int] = 60
+
+
+class CreateBookingRequest(BaseModel):
+    sport: str
+    court_id: str  # e.g., "badminton-1"
+    customer_name: str
+    customer_phone: Optional[str] = None
+    start_time_iso: str
+    duration_minutes: Optional[int] = 60
+    notes: Optional[str] = None
+    caller_number: Optional[str] = None
 
 
 ALLERGEN_MAP = {
@@ -1072,6 +1090,194 @@ async def send_order_notifications_task(order_data: dict):
         await send_whatsapp_message(phone, msg_cust, TPL_CUSTOMER, vars_cust)
     
     print(f"[notifikacie] Objednávka {pizza} spracovaná.")
+
+
+def normalize_sport(sport: str) -> str:
+    s = str(sport or "").lower().strip()
+    if "badminton" in s or "bedminton" in s:
+        return "badminton"
+    if "squash" in s or "skvoš" in s:
+        return "squash"
+    if "clay" in s or "antuka" in s:
+        return "tennis-clay"
+    if "tennis" in s or "tenis" in s:
+        return "tennis"
+    return "badminton"  # default fallback
+
+
+def format_court_name(court_id: str) -> str:
+    parts = court_id.split("-")
+    if len(parts) < 2:
+        return court_id
+    sport = parts[0]
+    num = parts[1].zfill(2)
+    if sport == "tennis-clay":
+        return f"Dvorec {num}"
+    return f"Kurt {num}"
+
+
+@app.post("/api/ntc-check-availability")
+async def ntc_check_availability(req: CheckAvailabilityRequest):
+    """
+    Checks Google Calendar events to find free courts for NTC bookings.
+    """
+    sport_key = normalize_sport(req.sport)
+    
+    # Parse dates
+    try:
+        start_str = req.start_time_iso.replace("Z", "+00:00")
+        start_dt = datetime.datetime.fromisoformat(start_str)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Chybný formát start_time_iso: {e}")
+
+    duration = req.duration_minutes or 60
+    end_dt = start_dt + datetime.timedelta(minutes=duration)
+
+    print(f"[ntc-check] Checking availability for {sport_key} from {start_dt.isoformat()} to {end_dt.isoformat()}")
+
+    # Buffer of 1 minute to avoid boundaries overlap
+    time_min = (start_dt + datetime.timedelta(minutes=1)).isoformat()
+    time_max = (end_dt - datetime.timedelta(minutes=1)).isoformat()
+    
+    from google_calendar import list_calendar_events
+    events = await list_calendar_events(NTC_TENANT_ID, time_min, time_max)
+
+    busy_courts = set()
+    for event in events:
+        summary = event.get("summary", "")
+        description = event.get("description", "")
+        
+        # Check description and summary for court ID
+        court_id = None
+        
+        # Parse description
+        for line in description.split("\n"):
+            parts = line.split(":")
+            if len(parts) >= 2:
+                key = parts[0].strip().lower()
+                val = ":".join(parts[1:]).strip()
+                if key in ["kurt id", "court id", "courtid", "court"]:
+                    court_id = val.strip().lower()
+                    break
+        
+        if not court_id:
+            import re
+            court_pattern = r"(badminton|squash|tennis|tennis-clay)-\d+"
+            desc_match = re.search(court_pattern, description, re.IGNORECASE)
+            if desc_match:
+                court_id = desc_match.group(0).lower()
+            else:
+                summary_match = re.search(court_pattern, summary, re.IGNORECASE)
+                if summary_match:
+                    court_id = summary_match.group(0).lower()
+
+        if court_id:
+            busy_courts.add(court_id)
+
+    # Determine court capacity
+    # badminton: 14 courts, tennis: 8, squash: 4, clay: 4
+    limit = 14 if sport_key == "badminton" else (8 if sport_key == "tennis" else 4)
+    all_sport_courts = [f"{sport_key}-{i}" for i in range(1, limit + 1)]
+    free_courts = [c for c in all_sport_courts if c not in busy_courts]
+
+    if not free_courts:
+        return {
+            "status": "busy",
+            "message": f"Pre {req.sport} v tomto čase nie sú žiadne voľné kurty.",
+            "free_courts": []
+        }
+
+    free_court_names = [format_court_name(c) for c in free_courts]
+    
+    return {
+        "status": "available",
+        "message": f"Pre {req.sport} sú voľné nasledovné kurty: {', '.join(free_court_names)}.",
+        "free_courts": free_courts,
+        "free_court_names": free_court_names
+    }
+
+
+@app.post("/api/ntc-create-booking")
+async def ntc_create_booking(req: CreateBookingRequest):
+    """
+    Saves a booking in the Supabase bookings table and Google Calendar.
+    """
+    sport_key = normalize_sport(req.sport)
+    
+    try:
+        start_str = req.start_time_iso.replace("Z", "+00:00")
+        start_dt = datetime.datetime.fromisoformat(start_str)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Chybný formát start_time_iso: {e}")
+
+    duration = req.duration_minutes or 60
+    end_dt = start_dt + datetime.timedelta(minutes=duration)
+
+    # 1. Save to Supabase bookings table
+    import json
+    notes_obj = {
+        "courtId": req.court_id,
+        "source": "voice-assistant",
+        "notes": req.notes or "Rezervácia cez hlasového asistenta"
+    }
+
+    booking_data = {
+        "tenant_id": NTC_TENANT_ID,
+        "customer_name": req.customer_name,
+        "customer_phone": req.customer_phone or req.caller_number or "",
+        "start_at": start_dt.isoformat(),
+        "end_at": end_dt.isoformat(),
+        "status": "confirmed",
+        "notes": json.dumps(notes_obj)
+    }
+
+    try:
+        db_res = supabase.table("bookings").insert(booking_data).execute()
+        if not db_res.data:
+            raise Exception("Chyba: DB nevrátila žiadne dáta.")
+        db_booking = db_res.data[0]
+    except Exception as db_err:
+        print(f"[ntc-booking] Database insertion failed: {db_err}")
+        raise HTTPException(status_code=500, detail=f"Zápis do Supabase zlyhal: {db_err}")
+
+    # 2. Sync to Google Calendar
+    court_label = req.court_id.replace("-", " ").upper()
+    summary = f"Rezervácia: {court_label} ({req.customer_name})"
+    
+    description = "\n".join([
+        f"Kurt ID: {req.court_id}",
+        f"Zákazník: {req.customer_name}",
+        f"Telefón: {req.customer_phone or req.caller_number or 'Neznáme'}",
+        "Kanál: Hlas Telio",
+        f"Poznámka: {req.notes or ''}"
+    ])
+
+    from google_calendar import create_calendar_event
+    calendar_event_id = await create_calendar_event(
+        tenant_id=NTC_TENANT_ID,
+        summary=summary,
+        description=description,
+        start_iso=start_dt.isoformat(),
+        end_iso=end_dt.isoformat(),
+        color_id="7"  # Peacock (light blue) for voice reservations
+    )
+
+    # 3. Update database record with calendar_event_id
+    if calendar_event_id:
+        try:
+            supabase.table("bookings") \
+                .update({"calendar_event_id": calendar_event_id}) \
+                .eq("id", db_booking["id"]) \
+                .execute()
+        except Exception as update_err:
+            print(f"[ntc-booking] Failed to update calendar_event_id in DB: {update_err}")
+
+    court_name_spoken = format_court_name(req.court_id)
+    return {
+        "status": "success",
+        "message": f"Rezervácia pre {req.customer_name} na {court_name_spoken} bola úspešne vytvorená.",
+        "booking_id": calendar_event_id or db_booking["id"]
+    }
 
 
 @app.post("/api/vytvor-objednavku")
