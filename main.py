@@ -690,7 +690,7 @@ async def twilio_voice_webhook(request: Request):
             
         return f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say>{msg}</Say>
+    <Say language="sk-SK">{msg}</Say>
     <Pause length="1"/>
     <Hangup/>
 </Response>'''
@@ -785,8 +785,16 @@ async def twilio_voice_webhook(request: Request):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        print(f"[twilio/voice] ElevenLabs register_call zlyhal: {e}")
-        return Response(content=unavailable_twiml(str(e)), media_type="application/xml")
+        error_msg = str(e)
+        try:
+            if hasattr(e, "body") and e.body:
+                error_msg += f" | Detail: {e.body}"
+            elif hasattr(e, "status_code"):
+                error_msg += f" | Status: {e.status_code}"
+        except:
+            pass
+        print(f"[twilio/voice] ElevenLabs register_call zlyhal: {error_msg}")
+        return Response(content=unavailable_twiml(error_msg), media_type="application/xml")
 
 
 @app.api_route("/twilio/fallback", methods=["GET", "POST"])
