@@ -79,7 +79,14 @@ print(f"TENANT_ID nastavene: {'ano' if bool(TENANT_ID) else 'nie'}")
 print(f"ELEVENLABS_API_KEY nastavene: {'ano' if bool(ELEVENLABS_API_KEY) else 'nie'}")
 print(f"ELEVENLABS_AGENT_ID nastavene: {'ano' if bool(ELEVENLABS_AGENT_ID) else 'nie'}")
 print(f"TWILIO_ACCOUNT_SID nastavene: {'ano' if bool(os.getenv('TWILIO_ACCOUNT_SID')) else 'nie'}")
-print(f"TWILIO_TWIML_APP_SID nastavene: {'ano' if bool(os.getenv('TWILIO_TWIML_APP_SID')) else 'nie'}")
+twilio_app_sid_env = (
+    os.getenv("TWILIO_TWIML_APP_SID") or
+    os.getenv("TWILIO_APP_SID") or
+    os.getenv("TWIML_APP_SID") or
+    os.getenv("TWILIO_TWIML_APP_ID") or
+    os.getenv("TWILIO_APP_ID")
+)
+print(f"TWILIO_TWIML_APP_SID nastavene: {'ano' if bool(twilio_app_sid_env) else 'nie'}")
 print(f"CORS_ALLOW_ORIGINS: {CORS_ALLOW_ORIGINS}")
 print("----------------------")
 
@@ -628,7 +635,14 @@ async def get_twilio_token():
     account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
     api_key = os.getenv("TWILIO_API_KEY", "").strip()
     api_secret = os.getenv("TWILIO_API_SECRET", "").strip()
-    twiml_app_sid = os.getenv("TWILIO_TWIML_APP_SID", "").strip()
+    twiml_app_sid = (
+        os.getenv("TWILIO_TWIML_APP_SID") or
+        os.getenv("TWILIO_APP_SID") or
+        os.getenv("TWIML_APP_SID") or
+        os.getenv("TWILIO_TWIML_APP_ID") or
+        os.getenv("TWILIO_APP_ID") or
+        ""
+    ).strip()
 
     if not account_sid or not api_key or not api_secret or not twiml_app_sid:
         print(f"[twilio/token] FAIL: Missing credentials. account_sid={bool(account_sid)}, api_key={bool(api_key)}, api_secret={bool(api_secret)}, twiml_app_sid={bool(twiml_app_sid)}")
