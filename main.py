@@ -661,17 +661,22 @@ async def twilio_voice_webhook(request: Request):
     4. ElevenLabs vrati hotove TwiML pre Twilio Media Stream
     5. Render vrati toto TwiML priamo Twiliu
     """
-    def unavailable_twiml() -> str:
+    def unavailable_twiml(error_msg: str = None) -> str:
         audio_url = os.getenv("AUDIO_LINKA_NEDOSTUPNA", "").strip()
-        if audio_url:
+        if audio_url and not error_msg:
             return f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>{xml_escape(audio_url, quote=False)}</Play>
     <Hangup/>
 </Response>'''
-        return '''<?xml version="1.0" encoding="UTF-8"?>
+        
+        msg = "Dobry den, lutujeme, nasa objednavkova linka je momentalne nedostupna. Skuste prosim zavolat o chvilu neskor."
+        if error_msg:
+            msg = f"Chyba registracie hovoru: {xml_escape(error_msg, quote=False)}"
+            
+        return f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say>Dobry den, lutujeme, nasa objednavkova linka je momentalne nedostupna. Skuste prosim zavolat o chvilu neskor. Prajeme pekny den.</Say>
+    <Say>{msg}</Say>
     <Pause length="1"/>
     <Hangup/>
 </Response>'''
@@ -680,7 +685,7 @@ async def twilio_voice_webhook(request: Request):
     ok, reason = await _check_systems()
     if not ok:
         print(f"[twilio/voice] Systemy nedostupne: {reason}")
-        return Response(content=unavailable_twiml(), media_type="application/xml")
+        return Response(content=unavailable_twiml(f"Systemy nedostupne: {reason}"), media_type="application/xml")
 
     #TWILIO FORM DATA
     try:
@@ -764,8 +769,10 @@ async def twilio_voice_webhook(request: Request):
         print("[twilio/voice] ElevenLabs register_call OK, vraciam TwiML Twiliu")
         return Response(content=twiml, media_type="application/xml")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"[twilio/voice] ElevenLabs register_call zlyhal: {e}")
-        return Response(content=unavailable_twiml(), media_type="application/xml")
+        return Response(content=unavailable_twiml(str(e)), media_type="application/xml")
 
 
 @app.api_route("/twilio/fallback", methods=["GET", "POST"])
