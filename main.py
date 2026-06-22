@@ -612,6 +612,41 @@ def health_config():
     }
 
 
+@app.get("/twilio/token")
+async def get_twilio_token():
+    """
+    Generates a Twilio capability token for browser-based WebRTC calls.
+    Uses TWILIO_ACCOUNT_SID, TWILIO_API_KEY, and TWILIO_API_SECRET.
+    """
+    import time
+    from twilio.jwt.access_token import AccessToken
+    from twilio.jwt.access_token.grants import VoiceGrant
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    api_key = os.getenv("TWILIO_API_KEY", "").strip()
+    api_secret = os.getenv("TWILIO_API_SECRET", "").strip()
+    twiml_app_sid = os.getenv("TWILIO_TWIML_APP_SID", "").strip()
+
+    if not account_sid or not api_key or not api_secret:
+        print("[twilio/token] FAIL: Missing credentials")
+        raise HTTPException(status_code=500, detail="Missing Twilio credentials on server")
+
+    identity = f"web-user-{int(time.time())}"
+    
+    # Create Access Token
+    token = AccessToken(account_sid, api_key, api_secret, identity=identity)
+    
+    # Create Voice Grant
+    voice_grant = VoiceGrant(
+        outgoing_application_sid=twiml_app_sid,
+        incoming_allow=True
+    )
+    token.add_grant(voice_grant)
+
+    print(f"[twilio/token] Token generated successfully for identity={identity}")
+    return {"token": token.to_jwt(), "identity": identity}
+
+
 @app.api_route("/twilio/incoming", methods=["GET", "POST"])
 @app.api_route("/twilio/voice", methods=["GET", "POST"])
 async def twilio_voice_webhook(request: Request):
@@ -677,11 +712,30 @@ async def twilio_voice_webhook(request: Request):
         called_number = ""
         call_sid = ""
 
-    # 3. MENU Z DB -> DYNAMIC VARIABLE
-    menu = format_menu_from_db(TENANT_ID)
-    if not menu:
-        menu = "Menu momentalne nie je dostupne."
-    print(f"[twilio/voice] Menu nacitane, dlzka={len(menu)} znakov")
+    # Smerovanie podla cisla alebo parametra business_type
+    business_type = form_data.get("business_type") or ""
+    dialed_number = called_number or to_number
+    ntc_phone = os.getenv("NTC_PHONE_NUMBER", "+420910925466").strip()
+    elevenlabs_ntc_agent_id = os.getenv("ELEVENLABS_NTC_AGENT_ID", "9901kv6j21rhfccr7f0nbdhew5ew").strip()
+
+    is_ntc = (
+        business_type == "taxi" or 
+        (dialed_number == ntc_phone or (dialed_number and dialed_number.endswith(ntc_phone.replace("+", ""))))
+    )
+
+    if is_ntc:
+        agent_id = elevenlabs_ntc_agent_id or ELEVENLABS_AGENT_ID
+        active_tenant_id = NTC_TENANT_ID
+        menu = ""
+        print(f"[twilio/voice] Routing call to NTC Voice Assistant. AgentID={agent_id}, Tenant={active_tenant_id}")
+    else:
+        agent_id = ELEVENLABS_AGENT_ID
+        active_tenant_id = TENANT_ID
+        # 3. MENU Z DB -> DYNAMIC VARIABLE
+        menu = format_menu_from_db(active_tenant_id)
+        if not menu:
+            menu = "Menu momentalne nie je dostupne."
+        print(f"[twilio/voice] Routing call to Pizzeria. AgentID={agent_id}, Tenant={active_tenant_id}")
 
     # 4. ELEVENLABS REGISTER CALL -> HOTOVE TWIML PRE TWILIO
     try:
@@ -689,7 +743,7 @@ async def twilio_voice_webhook(request: Request):
 
         client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
         twiml = client.conversational_ai.twilio.register_call(
-            agent_id=ELEVENLABS_AGENT_ID,
+            agent_id=agent_id,
             from_number=from_number,
             to_number=to_number,
             direction="inbound",
@@ -700,6 +754,7 @@ async def twilio_voice_webhook(request: Request):
                     "from_number": from_number,
                     "to_number": to_number,
                     "call_sid": call_sid,
+                    "tenant_id": active_tenant_id,
                 }
             },
         )
@@ -735,11 +790,20 @@ async def twilio_status_webhook(request: Request):
 
 
 @app.post("/api/prompt-config")
-async def prompt_config():
+async def prompt_config(request: Request):
     """
     ElevenLabs Server URL endpoint — volá sa pred každým hovorom.
-    Vracia dynamic_variables s aktuálnym menu z DB.
+    Vracia dynamic_variables s aktuálnym menu z DB alebo neutrálne dáta pre NTC.
     """
+    tenant = request.query_params.get("tenant", "pizzeria")
+    
+    if tenant == "ntc":
+        return {
+            "dynamic_variables": {
+                "menu": "U nás si môžete rezervovať kurty na tenis a bedminton.",
+            }
+        }
+
     menu_text = format_menu_from_db(TENANT_ID)
     return {
         "dynamic_variables": {
