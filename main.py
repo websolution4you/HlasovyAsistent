@@ -684,13 +684,14 @@ async def twilio_voice_webhook(request: Request):
     <Hangup/>
 </Response>'''
         
-        msg = "Dobry den, lutujeme, nasa objednavkova linka je momentalne nedostupna. Skuste prosim zavolat o chvilu neskor."
+        msg = "Sorry, our order line is currently unavailable. Please try again later."
+        lang = "en-US"
         if error_msg:
-            msg = f"Chyba registracie hovoru: {xml_escape(error_msg, quote=False)}"
+            msg = error_msg
             
         return f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say language="sk-SK">{msg}</Say>
+    <Say language="{lang}">{xml_escape(msg, quote=False)}</Say>
     <Pause length="1"/>
     <Hangup/>
 </Response>'''
@@ -699,7 +700,7 @@ async def twilio_voice_webhook(request: Request):
     ok, reason = await _check_systems()
     if not ok:
         print(f"[twilio/voice] Systemy nedostupne: {reason}")
-        return Response(content=unavailable_twiml(f"Systemy nedostupne: {reason}"), media_type="application/xml")
+        return Response(content=unavailable_twiml(f"System error: systems unavailable: {reason}"), media_type="application/xml")
 
     #TWILIO FORM DATA
     try:
@@ -763,7 +764,13 @@ async def twilio_voice_webhook(request: Request):
     try:
         from elevenlabs import ElevenLabs
 
-        client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+        # Support separate API key for NTC if configured in environment variables
+        el_api_key = (os.getenv("ELEVENLABS_NTC_API_KEY") or "").strip() if is_ntc else ""
+        if not el_api_key:
+            el_api_key = ELEVENLABS_API_KEY
+            
+        print(f"[twilio/voice] Creating ElevenLabs client using {'NTC' if (is_ntc and os.getenv('ELEVENLABS_NTC_API_KEY')) else 'default'} API key.")
+        client = ElevenLabs(api_key=el_api_key)
         twiml = client.conversational_ai.twilio.register_call(
             agent_id=agent_id,
             from_number=from_number,
@@ -785,16 +792,26 @@ async def twilio_voice_webhook(request: Request):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        error_msg = str(e)
-        try:
-            if hasattr(e, "body") and e.body:
-                error_msg += f" | Detail: {e.body}"
-            elif hasattr(e, "status_code"):
-                error_msg += f" | Status: {e.status_code}"
-        except:
-            pass
-        print(f"[twilio/voice] ElevenLabs register_call zlyhal: {error_msg}")
-        return Response(content=unavailable_twiml(error_msg), media_type="application/xml")
+        status_code = getattr(e, "status_code", None)
+        body = getattr(e, "body", None)
+        headers = getattr(e, "headers", None)
+        
+        clean_detail = ""
+        if isinstance(body, dict):
+            detail = body.get("detail")
+            if isinstance(detail, dict):
+                clean_detail = detail.get("message") or detail.get("status") or str(detail)
+            else:
+                clean_detail = str(detail) if detail else ""
+        elif isinstance(body, str):
+            clean_detail = body
+            
+        if not clean_detail:
+            clean_detail = str(body) if body else str(e)
+            
+        print(f"[twilio/voice] ElevenLabs register_call failed: Status: {status_code} | Detail: {clean_detail} | Headers: {headers}")
+        spoken_msg = f"Eleven Labs call registration failed. Status: {status_code or 'unknown'}. Detail: {clean_detail}"
+        return Response(content=unavailable_twiml(spoken_msg), media_type="application/xml")
 
 
 @app.api_route("/twilio/fallback", methods=["GET", "POST"])
