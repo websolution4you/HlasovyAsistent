@@ -1191,6 +1191,9 @@ async def ntc_check_availability(req: CheckAvailabilityRequest):
     # Parse dates
     try:
         start_str = req.start_time_iso.replace("Z", "+00:00")
+        if "+" not in start_str and "-" not in start_str.split("T")[-1]:
+            # No timezone offset, assume Europe/Bratislava local time (+02:00 in summer)
+            start_str += "+02:00"
         start_dt = datetime.datetime.fromisoformat(start_str)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Chybný formát start_time_iso: {e}")
@@ -1271,6 +1274,9 @@ async def ntc_create_booking(req: CreateBookingRequest):
     
     try:
         start_str = req.start_time_iso.replace("Z", "+00:00")
+        if "+" not in start_str and "-" not in start_str.split("T")[-1]:
+            # No timezone offset, assume Europe/Bratislava local time (+02:00 in summer)
+            start_str += "+02:00"
         start_dt = datetime.datetime.fromisoformat(start_str)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Chybný formát start_time_iso: {e}")
