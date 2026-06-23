@@ -746,7 +746,8 @@ async def twilio_voice_webhook(request: Request):
 
     is_ntc = (
         business_type == "taxi" or 
-        (dialed_number == ntc_phone or (dialed_number and dialed_number.endswith(ntc_phone.replace("+", ""))))
+        (dialed_number == ntc_phone or (dialed_number and dialed_number.endswith(ntc_phone.replace("+", "")))) or
+        (dialed_number and dialed_number.endswith("922442"))
     )
 
     if is_ntc:
