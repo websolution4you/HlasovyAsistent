@@ -19,6 +19,7 @@ load_dotenv()
 # --- ELEVENLABS KONFIGURÁCIA ---
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
 ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "").strip()
+ELEVENLABS_AGENT_ID_PIZZA = os.getenv("ELEVENLABS_AGENT_ID_PIZZA", "").strip()
 
 app = FastAPI(title="ElevenLabs Pizza Webhook")
 
@@ -78,6 +79,7 @@ print(f"CORE_SUPABASE_SERVICE_ROLE_KEY nastavene: {'ano' if bool(SUPABASE_KEY) e
 print(f"TENANT_ID nastavene: {'ano' if bool(TENANT_ID) else 'nie'}")
 print(f"ELEVENLABS_API_KEY nastavene: {'ano' if bool(ELEVENLABS_API_KEY) else 'nie'}")
 print(f"ELEVENLABS_AGENT_ID nastavene: {'ano' if bool(ELEVENLABS_AGENT_ID) else 'nie'}")
+print(f"ELEVENLABS_AGENT_ID_PIZZA nastavene: {'ano' if bool(ELEVENLABS_AGENT_ID_PIZZA) else 'nie'}")
 print(f"TWILIO_ACCOUNT_SID nastavene: {'ano' if bool(os.getenv('TWILIO_ACCOUNT_SID')) else 'nie'}")
 twilio_app_sid_env = (
     os.getenv("TWILIO_TWIML_APP_SID") or
@@ -508,6 +510,7 @@ async def _check_systems() -> tuple[bool, str]:
     print(f"[check_systems] supabase ready: {supabase is not None}")
     print(f"[check_systems] ELEVENLABS_API_KEY nastaveny: {bool(ELEVENLABS_API_KEY)}")
     print(f"[check_systems] ELEVENLABS_AGENT_ID nastaveny: {bool(ELEVENLABS_AGENT_ID)}")
+    print(f"[check_systems] ELEVENLABS_AGENT_ID_PIZZA nastaveny: {bool(ELEVENLABS_AGENT_ID_PIZZA)}")
 
     if not supabase:
         print("[check_systems] FAIL: Supabase klient nie je inicializovany")
@@ -521,9 +524,9 @@ async def _check_systems() -> tuple[bool, str]:
     if not ELEVENLABS_API_KEY:
         print("[check_systems] FAIL: ELEVENLABS_API_KEY chyba")
         return False, "Chyba ELEVENLABS_API_KEY"
-    if not ELEVENLABS_AGENT_ID:
-        print("[check_systems] FAIL: ELEVENLABS_AGENT_ID chyba")
-        return False, "Chyba ELEVENLABS_AGENT_ID"
+    if not ELEVENLABS_AGENT_ID and not ELEVENLABS_AGENT_ID_PIZZA:
+        print("[check_systems] FAIL: Ani ELEVENLABS_AGENT_ID ani ELEVENLABS_AGENT_ID_PIZZA nie je nastaveny")
+        return False, "Chyba ELEVENLABS_AGENT_ID aj ELEVENLABS_AGENT_ID_PIZZA"
     print("[check_systems] Vsetko OK")
     return True, "OK"
 
@@ -747,12 +750,12 @@ async def twilio_voice_webhook(request: Request):
     )
 
     if is_ntc:
-        agent_id = elevenlabs_ntc_agent_id or ELEVENLABS_AGENT_ID
+        agent_id = elevenlabs_ntc_agent_id or ELEVENLABS_AGENT_ID_PIZZA or ELEVENLABS_AGENT_ID
         active_tenant_id = NTC_TENANT_ID
         menu = ""
         print(f"[twilio/voice] Routing call to NTC Voice Assistant. AgentID={agent_id}, Tenant={active_tenant_id}")
     else:
-        agent_id = ELEVENLABS_AGENT_ID
+        agent_id = ELEVENLABS_AGENT_ID_PIZZA or ELEVENLABS_AGENT_ID
         active_tenant_id = TENANT_ID
         # 3. MENU Z DB -> DYNAMIC VARIABLE
         menu = format_menu_from_db(active_tenant_id)
