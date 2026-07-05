@@ -1544,6 +1544,13 @@ async def request_human_fallback(request: Request):
 
         # --- TWILIO FALLBACK (Presmerovanie hovoru) ---
         call_sid = dyn_vars.get("call_sid")
+        if not call_sid and caller_number:
+            for sid, num in reversed(list(CALL_CONTEXT.items())):
+                if num == caller_number:
+                    call_sid = sid
+                    print(f"[fallback] Nasiel som call_sid={call_sid} cez CALL_CONTEXT pre cislo {caller_number}")
+                    break
+
         if call_sid:
             try:
                 from twilio.rest import Client
