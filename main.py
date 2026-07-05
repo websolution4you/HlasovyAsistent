@@ -1501,9 +1501,10 @@ async def request_human_fallback(request: Request):
             or _is_twilio_owned_number(normalized_caller)
         )
         
+        dyn_vars = body.get("dynamic_variables", {})
+        
         if is_invalid:
             # 1. Skusime vytiahnut z dynamic_variables od ElevenLabs (ak su pritomne)
-            dyn_vars = body.get("dynamic_variables", {})
             el_caller = _normalize_phone(dyn_vars.get("caller_number") or dyn_vars.get("from_number") or "")
             
             if (
@@ -1537,9 +1538,30 @@ async def request_human_fallback(request: Request):
         except Exception as db_err:
             print(f"[fallback] Varovanie: Zápis do DB zlyhal: {db_err}")
 
-        ENABLE_WHATSAPP = os.getenv("ENABLE_WHATSAPP", "false").lower() == "true"
+        # ENABLE_WHATSAPP = os.getenv("ENABLE_WHATSAPP", "false").lower() == "true"
+        ENABLE_WHATSAPP = False  # Dočasne vypnuté podľa požiadavky
+        RESTAURANT_PHONE = os.getenv("RESTAURANT_PHONE", "+421910922442")
+
+        # --- TWILIO FALLBACK (Presmerovanie hovoru) ---
+        call_sid = dyn_vars.get("call_sid")
+        if call_sid:
+            try:
+                from twilio.rest import Client
+                account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+                auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+                
+                if account_sid and auth_token:
+                    client = Client(account_sid, auth_token)
+                    twiml_instruction = f"<Response><Dial>{RESTAURANT_PHONE}</Dial></Response>"
+                    client.calls(call_sid).update(twiml=twiml_instruction)
+                    print(f"[fallback] Hovor {call_sid} presmerovany na {RESTAURANT_PHONE}.")
+                else:
+                    print("[fallback] Nemozem presmerovat hovor, chybaju TWILIO_ACCOUNT_SID alebo TWILIO_AUTH_TOKEN.")
+            except Exception as twilio_err:
+                print(f"[fallback] Chyba pri presmerovani hovoru cez Twilio: {twilio_err}")
+
+        # --- WhatsApp Notifikacia ---
         if ENABLE_WHATSAPP:
-            RESTAURANT_PHONE = os.getenv("RESTAURANT_PHONE", "+421910922442")
             TPL_RESTAURANT_FALLBACK = os.getenv("TWILIO_TPL_RESTAURANT_FALLBACK")
             
             msg_rest = f"⚠️ *ŽIADOSŤ O KONTAKT* \n\nZákazník na čísle {caller_number} žiada o rozhovor s obsluhou.\nDôvod: {reason}"
