@@ -1317,8 +1317,69 @@ async def ntc_check_availability(req: CheckAvailabilityRequest):
     }
 
 
+async def send_ntc_booking_notification(phone: str, sport: str, court_id: str, start_iso: str, duration: int):
+    """Odosle WhatsApp notifikaciu o rezervacii kurtu v NTC cez Twilio REST API"""
+    ENABLE_WHATSAPP = os.getenv("ENABLE_WHATSAPP", "false").lower() == "true"
+    if not ENABLE_WHATSAPP:
+        print("[ntc-notifikacie] WhatsApp je vypnuty (ENABLE_WHATSAPP=false).")
+        return False
+
+    TPL_NTC_CUSTOMER = os.getenv("TWILIO_TPL_NTC_CUSTOMER", "HXf06a4115a2733f1bba940a857301c106").strip()
+    if not phone:
+        print("[ntc-notifikacie] Chybajuce telefonne cislo zakaznika, neodosielam.")
+        return False
+
+    # 1. Format sport
+    sport_map = {
+        "tennis": "Tenis",
+        "tennis-clay": "Tenis antuka",
+        "badminton": "Bedminton",
+        "squash": "Squash"
+    }
+    sport_formatted = sport_map.get(sport.lower().strip(), sport)
+
+    # 2. Format court
+    court_formatted = format_court_name(court_id)
+
+    # 3. Format date & time (in Europe/Bratislava timezone)
+    try:
+        # Standard input: e.g. 2026-06-21T10:00:00+02:00 or 2026-06-21T10:00:00
+        clean_start = start_iso.replace("Z", "+00:00")
+        if "+" not in clean_start and "-" not in clean_start.split("T")[-1]:
+            # No offset, assume Europe/Bratislava local time
+            clean_start += "+02:00"
+        
+        start_dt = datetime.datetime.fromisoformat(clean_start)
+        
+        # Date format: e.g., "15. 10. 2026"
+        date_formatted = start_dt.strftime("%d. %m. %Y").replace(" 0", " ")
+        if date_formatted.startswith("0"):
+            date_formatted = date_formatted[1:]
+            
+        end_dt = start_dt + datetime.timedelta(minutes=duration)
+        time_formatted = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
+    except Exception as e:
+        print(f"[ntc-notifikacie] Chyba pri formatovani datumu/casu ({start_iso}): {e}")
+        date_formatted = start_iso.split("T")[0] if "T" in start_iso else start_iso
+        time_formatted = f"{duration} min"
+
+    msg_body = f"Potvrdzujeme rezerváciu kurtu. Šport: {sport_formatted}, Kurt: {court_formatted}, Dátum: {date_formatted}, Čas: {time_formatted}"
+    
+    # Premenné pre novú schválenú šablónu (zakaznik_potvrdenie_ntc):
+    # {{1}} -> Šport, {{2}} -> Kurt, {{3}} -> Dátum, {{4}} -> Čas
+    vars_cust = {
+        "1": sport_formatted,
+        "2": court_formatted,
+        "3": date_formatted,
+        "4": time_formatted
+    }
+
+    print(f"[ntc-notifikacie] Posielam NTC WA notifikaciu na {phone}: {msg_body}")
+    return await send_whatsapp_message(phone, msg_body, TPL_NTC_CUSTOMER, vars_cust)
+
+
 @app.post("/api/ntc-create-booking")
-async def ntc_create_booking(req: CreateBookingRequest):
+async def ntc_create_booking(req: CreateBookingRequest, background_tasks: BackgroundTasks):
     """
     Saves a booking in the Supabase bookings table and Google Calendar.
     """
@@ -1394,6 +1455,19 @@ async def ntc_create_booking(req: CreateBookingRequest):
                 .execute()
         except Exception as update_err:
             print(f"[ntc-booking] Failed to update calendar_event_id in DB: {update_err}")
+
+    # 4. Send WhatsApp Notification to Customer on Background
+    customer_phone = req.customer_phone or req.caller_number
+    if customer_phone:
+        print(f"[ntc-booking] Planujem odoslanie WhatsApp notifikacie na {customer_phone}")
+        background_tasks.add_task(
+            send_ntc_booking_notification,
+            phone=customer_phone,
+            sport=req.sport,
+            court_id=req.court_id,
+            start_iso=req.start_time_iso,
+            duration=duration
+        )
 
     court_name_spoken = format_court_name(req.court_id)
     return {
