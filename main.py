@@ -1457,12 +1457,25 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
             print(f"[ntc-booking] Failed to update calendar_event_id in DB: {update_err}")
 
     # 4. Send WhatsApp Notification to Customer on Background
-    customer_phone = req.customer_phone or req.caller_number
-    if customer_phone:
-        print(f"[ntc-booking] Planujem odoslanie WhatsApp notifikacie na {customer_phone}")
+    caller_number = _normalize_phone(req.caller_number or "")
+    payload_phone = _normalize_phone(req.customer_phone or "")
+
+    if caller_number and not _is_twilio_owned_number(caller_number):
+        real_phone = caller_number
+    elif payload_phone and not _is_twilio_owned_number(payload_phone):
+        real_phone = payload_phone
+    elif _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
+        real_phone = _LAST_CALLER_PHONE
+        print(f"[ntc-booking] caller_number chýbalo, používam _LAST_CALLER_PHONE: {real_phone}")
+    else:
+        real_phone = ""
+        print(f"[ntc-booking] Nepodarilo sa získať platné číslo pre WA; caller_number={caller_number}, customer_phone={payload_phone}")
+
+    if real_phone:
+        print(f"[ntc-booking] Planujem odoslanie WhatsApp notifikacie na {real_phone}")
         background_tasks.add_task(
             send_ntc_booking_notification,
-            phone=customer_phone,
+            phone=real_phone,
             sport=req.sport,
             court_id=req.court_id,
             start_iso=req.start_time_iso,
