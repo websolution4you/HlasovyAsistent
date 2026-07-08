@@ -135,6 +135,8 @@ class CreateBookingRequest(BaseModel):
     duration_minutes: Optional[int] = 60
     notes: Optional[str] = None
     caller_number: Optional[str] = None
+    dynamic_variables: Optional[dict] = None
+
 
 
 ALLERGEN_MAP = {
@@ -1430,8 +1432,25 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
         "notes": req.notes or "Rezervácia cez hlasového asistenta"
     }
 
+    # Resolve customer phone number robustly from request and dynamic_variables
+    req_caller = req.caller_number or ""
+    dyn_vars = req.dynamic_variables or {}
+    dyn_caller = dyn_vars.get("caller_number") or dyn_vars.get("from_number") or ""
+    caller_number = _normalize_phone(req_caller or dyn_caller or "")
+    payload_phone = _normalize_phone(req.customer_phone or "")
+
+    if caller_number and not _is_twilio_owned_number(caller_number):
+        real_phone = caller_number
+    elif payload_phone and not _is_twilio_owned_number(payload_phone):
+        real_phone = payload_phone
+    elif _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
+        real_phone = _LAST_CALLER_PHONE
+        print(f"[ntc-booking] caller_number chýbalo, používam _LAST_CALLER_PHONE: {real_phone}")
+    else:
+        real_phone = ""
+
     # Find matching user in booking_users by phone number
-    phone_to_match = req.customer_phone or req.caller_number or ""
+    phone_to_match = real_phone or req.customer_phone or req.caller_number or ""
     user_id = find_user_id_by_phone(phone_to_match)
 
     booking_data = {
@@ -1464,7 +1483,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
     description = "\n".join([
         f"Kurt ID: {req.court_id}",
         f"Zákazník: {req.customer_name}",
-        f"Telefón: {req.customer_phone or req.caller_number or 'Neznáme'}",
+        f"Telefón: {phone_to_match or 'Neznáme'}",
         "Kanál: Hlas Telio",
         f"Poznámka: {req.notes or ''}"
     ])
@@ -1490,20 +1509,6 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
             print(f"[ntc-booking] Failed to update calendar_event_id in DB: {update_err}")
 
     # 4. Send WhatsApp Notification to Customer on Background
-    caller_number = _normalize_phone(req.caller_number or "")
-    payload_phone = _normalize_phone(req.customer_phone or "")
-
-    if caller_number and not _is_twilio_owned_number(caller_number):
-        real_phone = caller_number
-    elif payload_phone and not _is_twilio_owned_number(payload_phone):
-        real_phone = payload_phone
-    elif _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
-        real_phone = _LAST_CALLER_PHONE
-        print(f"[ntc-booking] caller_number chýbalo, používam _LAST_CALLER_PHONE: {real_phone}")
-    else:
-        real_phone = ""
-        print(f"[ntc-booking] Nepodarilo sa získať platné číslo pre WA; caller_number={caller_number}, customer_phone={payload_phone}")
-
     if real_phone:
         print(f"[ntc-booking] Planujem odoslanie WhatsApp notifikacie na {real_phone}")
         background_tasks.add_task(
@@ -1514,6 +1519,9 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
             start_iso=req.start_time_iso,
             duration=duration
         )
+    else:
+        print(f"[ntc-booking] Nepodarilo sa získať platné číslo pre WA; caller_number={caller_number}, customer_phone={payload_phone}")
+
 
     court_name_spoken = format_court_name(req.court_id)
     return {
@@ -1551,8 +1559,14 @@ async def vytvor_objednavku(request: Request, background_tasks: BackgroundTasks)
                 "address_confidence": confidence,
                         }
 
-                # caller_number poslali sme sami do ElevenLabs z Twilio From — je to spravne cislo volajuceho
-        caller_number = _normalize_phone(body.get("caller_number") or "")
+        # caller_number poslali sme sami do ElevenLabs z Twilio From — je to spravne cislo volajuceho
+        dyn_vars = body.get("dynamic_variables", {})
+        caller_number = _normalize_phone(
+            body.get("caller_number") or 
+            dyn_vars.get("caller_number") or 
+            dyn_vars.get("from_number") or 
+            ""
+        )
         payload_phone = _normalize_phone(body.get("customer_phone") or order.customer_phone or "")
 
         if caller_number and not _is_twilio_owned_number(caller_number):
