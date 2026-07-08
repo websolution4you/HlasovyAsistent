@@ -1497,7 +1497,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
     return {
         "status": "success",
         "message": f"Rezervácia pre {req.customer_name} na {court_name_spoken} bola úspešne vytvorená.",
-        "booking_id": calendar_event_id or db_booking["id"]
+        "booking_id": db_booking["id"]
     }
 
 
