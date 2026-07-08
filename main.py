@@ -168,6 +168,31 @@ def _normalize_phone(phone: str) -> str:
     return str(phone or "").strip().replace(" ", "")
 
 
+def find_user_id_by_phone(phone: str) -> Optional[str]:
+    if not phone or not supabase:
+        return None
+    
+    # Extract last 9 digits of input phone
+    digits_only = "".join(c for c in phone if c.isdigit())
+    if len(digits_only) < 9:
+        return None
+    input_last_9 = digits_only[-9:]
+    
+    try:
+        # Fetch all booking users (id and phone only)
+        res = supabase.table("booking_users").select("id, phone").execute()
+        if res.data:
+            for user in res.data:
+                user_phone = user.get("phone")
+                if user_phone:
+                    user_digits = "".join(c for c in user_phone if c.isdigit())
+                    if len(user_digits) >= 9 and user_digits[-9:] == input_last_9:
+                        return user.get("id")
+    except Exception as e:
+        print(f"[find-user] Failed to query booking_users: {e}")
+    return None
+
+
 def _twilio_owned_numbers() -> set[str]:
     raw = os.getenv("TWILIO_OWNED_NUMBERS", "").strip()
     configured = {_normalize_phone(item) for item in raw.split(",") if item.strip()}
@@ -1405,15 +1430,23 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
         "notes": req.notes or "Rezervácia cez hlasového asistenta"
     }
 
+    # Find matching user in booking_users by phone number
+    phone_to_match = req.customer_phone or req.caller_number or ""
+    user_id = find_user_id_by_phone(phone_to_match)
+
     booking_data = {
         "tenant_id": NTC_TENANT_ID,
         "customer_name": req.customer_name,
-        "customer_phone": req.customer_phone or req.caller_number or "",
+        "customer_phone": phone_to_match,
         "start_at": start_dt.isoformat(),
         "end_at": end_dt.isoformat(),
         "status": "confirmed",
         "notes": json.dumps(notes_obj)
     }
+
+    if user_id:
+        booking_data["user_id"] = user_id
+        print(f"[ntc-booking] Associated booking with user_id: {user_id} matching phone: {phone_to_match}")
 
     try:
         db_res = supabase.table("bookings").insert(booking_data).execute()
