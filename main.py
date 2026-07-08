@@ -925,10 +925,46 @@ async def prompt_config(request: Request):
     """
     tenant = request.query_params.get("tenant", "pizzeria")
     
+    # Try to extract the caller phone from the request body if ElevenLabs sends it
+    caller_phone = ""
+    try:
+        body = await request.json()
+        print(f"[prompt-config] ElevenLabs request body: {body}")
+        
+        # Look for phone in common body structures
+        raw_from = body.get("from_number") or body.get("caller_number") or ""
+        if not raw_from and isinstance(body.get("call"), dict):
+            raw_from = body["call"].get("from_number") or body["call"].get("caller_number") or ""
+        
+        # Or look for call_sid to match against CALL_CONTEXT
+        call_sid = body.get("call_sid") or ""
+        if not raw_from and call_sid:
+            raw_from = CALL_CONTEXT.get(call_sid, "")
+            
+        caller_phone = _normalize_phone(raw_from)
+    except Exception as e:
+        print(f"[prompt-config] Failed to parse request body: {e}")
+        
+    if not caller_phone or _is_twilio_owned_number(caller_phone):
+        # Fallback to last resolved customer phone
+        caller_phone = _LAST_CALLER_PHONE
+        print(f"[prompt-config] Using _LAST_CALLER_PHONE fallback: {caller_phone}")
+
     if tenant == "ntc":
+        client_name = ""
+        client_salutation = ""
+        if caller_phone:
+            client_name, _ = find_user_name_and_id_by_phone(caller_phone)
+            client_name = client_name or ""
+            if client_name:
+                client_salutation = format_client_salutation(client_name)
+        
+        print(f"[prompt-config] NTC resolved: client_name='{client_name}', client_salutation='{client_salutation}' for phone '{caller_phone}'")
         return {
             "dynamic_variables": {
                 "menu": "U nás si môžete rezervovať kurty na tenis a bedminton.",
+                "client_name": client_name,
+                "client_salutation": client_salutation,
             }
         }
 
