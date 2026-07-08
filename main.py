@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Tuple
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -170,29 +170,66 @@ def _normalize_phone(phone: str) -> str:
     return str(phone or "").strip().replace(" ", "")
 
 
-def find_user_id_by_phone(phone: str) -> Optional[str]:
+def find_user_name_and_id_by_phone(phone: str) -> Tuple[Optional[str], Optional[str]]:
     if not phone or not supabase:
-        return None
+        return None, None
     
     # Extract last 9 digits of input phone
     digits_only = "".join(c for c in phone if c.isdigit())
     if len(digits_only) < 9:
-        return None
+        return None, None
     input_last_9 = digits_only[-9:]
     
     try:
-        # Fetch all booking users (id and phone only)
-        res = supabase.table("booking_users").select("id, phone").execute()
+        # Fetch all booking users (id, phone, and name)
+        res = supabase.table("booking_users").select("id, phone, name").execute()
         if res.data:
             for user in res.data:
                 user_phone = user.get("phone")
                 if user_phone:
                     user_digits = "".join(c for c in user_phone if c.isdigit())
                     if len(user_digits) >= 9 and user_digits[-9:] == input_last_9:
-                        return user.get("id")
+                        return user.get("name"), user.get("id")
     except Exception as e:
         print(f"[find-user] Failed to query booking_users: {e}")
-    return None
+    return None, None
+
+
+def find_user_id_by_phone(phone: str) -> Optional[str]:
+    _, user_id = find_user_name_and_id_by_phone(phone)
+    return user_id
+
+
+def format_client_salutation(full_name: str) -> str:
+    """
+    Returns a Slovak salutation and name format, e.g. "pán Bartko" or "pani Kalavská".
+    """
+    if not full_name:
+        return ""
+    
+    parts = [p.strip() for p in full_name.strip().split() if p.strip()]
+    if not parts:
+        return ""
+    
+    # If it's a single word, just use it
+    if len(parts) == 1:
+        name = parts[0]
+        # heuristic for female
+        if name.endswith(("ová", "ova", "á")):
+            return f"pani {name}"
+        return f"pán {name}"
+        
+    # If it's two or more words, usually "Firstname Surname"
+    first = parts[0]
+    last = parts[-1]
+    
+    # Female check
+    # Slovak female surnames usually end with -ová, -ova, -á (e.g. Malá, Kalavská)
+    is_female = last.endswith(("ová", "ova", "á"))
+    
+    salutation = "pani" if is_female else "pán"
+    # We address by surname
+    return f"{salutation} {last}"
 
 
 def _twilio_owned_numbers() -> set[str]:
@@ -800,6 +837,15 @@ async def twilio_voice_webhook(request: Request):
         if not el_api_key:
             el_api_key = ELEVENLABS_API_KEY
             
+        client_name = ""
+        client_salutation = ""
+        if is_ntc and customer_number:
+            client_name, _ = find_user_name_and_id_by_phone(customer_number)
+            client_name = client_name or ""
+            if client_name:
+                client_salutation = format_client_salutation(client_name)
+            print(f"[twilio/voice] Resolved NTC customer name: {client_name}, salutation: {client_salutation}")
+
         print(f"[twilio/voice] Creating ElevenLabs client using {'NTC' if (is_ntc and os.getenv('ELEVENLABS_NTC_API_KEY')) else 'default'} API key.")
         client = ElevenLabs(api_key=el_api_key)
         twiml = client.conversational_ai.twilio.register_call(
@@ -815,6 +861,8 @@ async def twilio_voice_webhook(request: Request):
                     "to_number": to_number,
                     "call_sid": call_sid,
                     "tenant_id": active_tenant_id,
+                    "client_name": client_name,
+                    "client_salutation": client_salutation,
                 }
             },
         )
@@ -1405,6 +1453,42 @@ async def send_ntc_booking_notification(phone: str, sport: str, court_id: str, s
     return await send_whatsapp_message(phone, msg_body, TPL_NTC_CUSTOMER, vars_cust)
 
 
+async def perform_ntc_booking_async(
+    booking_data: dict,
+    real_phone: str,
+    sport: str,
+    court_id: str,
+    start_iso: str,
+    duration: int
+):
+    """
+    Background task to insert the booking into Supabase and send the WhatsApp notification.
+    """
+    try:
+        print(f"[ntc-booking-async] Odosielam rezerváciu do DB: {booking_data}")
+        db_res = supabase.table("bookings").insert(booking_data).execute()
+        if not db_res.data:
+            print("[ntc-booking-async] Database insertion did not return data.")
+            return
+        db_booking = db_res.data[0]
+        print(f"[ntc-booking-async] Rezervácia bola zapísaná pod ID: {db_booking.get('id')}")
+        
+        # Send WhatsApp Notification
+        if real_phone:
+            print(f"[ntc-booking-async] Planujem odoslanie WhatsApp notifikacie na {real_phone}")
+            await send_ntc_booking_notification(
+                phone=real_phone,
+                sport=sport,
+                court_id=court_id,
+                start_iso=start_iso,
+                duration=duration
+            )
+        else:
+            print("[ntc-booking-async] Nepodarilo sa získať platné číslo pre WA")
+    except Exception as e:
+        print(f"[ntc-booking-async] Chyba pri zápise rezervácie/notifikácii: {e}")
+
+
 @app.post("/api/ntc-create-booking")
 async def ntc_create_booking(req: CreateBookingRequest, background_tasks: BackgroundTasks):
     """
@@ -1467,37 +1551,22 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
         booking_data["user_id"] = user_id
         print(f"[ntc-booking] Associated booking with user_id: {user_id} matching phone: {phone_to_match}")
 
-    try:
-        db_res = supabase.table("bookings").insert(booking_data).execute()
-        if not db_res.data:
-            raise Exception("Chyba: DB nevrátila žiadne dáta.")
-        db_booking = db_res.data[0]
-    except Exception as db_err:
-        print(f"[ntc-booking] Database insertion failed: {db_err}")
-        raise HTTPException(status_code=500, detail=f"Zápis do Supabase zlyhal: {db_err}")
-
-
-
-    # 4. Send WhatsApp Notification to Customer on Background
-    if real_phone:
-        print(f"[ntc-booking] Planujem odoslanie WhatsApp notifikacie na {real_phone}")
-        background_tasks.add_task(
-            send_ntc_booking_notification,
-            phone=real_phone,
-            sport=req.sport,
-            court_id=req.court_id,
-            start_iso=req.start_time_iso,
-            duration=duration
-        )
-    else:
-        print(f"[ntc-booking] Nepodarilo sa získať platné číslo pre WA; caller_number={caller_number}, customer_phone={payload_phone}")
-
+    # Enqueue database insertion and notification task
+    background_tasks.add_task(
+        perform_ntc_booking_async,
+        booking_data=booking_data,
+        real_phone=real_phone,
+        sport=req.sport,
+        court_id=req.court_id,
+        start_iso=req.start_time_iso,
+        duration=duration
+    )
 
     court_name_spoken = format_court_name(req.court_id)
     return {
         "status": "success",
         "message": f"Rezervácia pre {req.customer_name} na {court_name_spoken} bola úspešne vytvorená.",
-        "booking_id": db_booking["id"]
+        "booking_id": "background"
     }
 
 
