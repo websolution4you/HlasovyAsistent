@@ -1480,13 +1480,17 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
     court_label = req.court_id.replace("-", " ").upper()
     summary = f"Rezervácia: {court_label} ({req.customer_name})"
     
-    description = "\n".join([
+    description_lines = [
         f"Kurt ID: {req.court_id}",
         f"Zákazník: {req.customer_name}",
         f"Telefón: {phone_to_match or 'Neznáme'}",
         "Kanál: Hlas Telio",
         f"Poznámka: {req.notes or ''}"
-    ])
+    ]
+    if user_id:
+        description_lines.append(f"Vlastník ID: {user_id}")
+        
+    description = "\n".join(description_lines)
 
     from google_calendar import create_calendar_event
     calendar_event_id = await create_calendar_event(
