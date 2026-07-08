@@ -1476,41 +1476,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
         print(f"[ntc-booking] Database insertion failed: {db_err}")
         raise HTTPException(status_code=500, detail=f"Zápis do Supabase zlyhal: {db_err}")
 
-    # 2. Sync to Google Calendar
-    court_label = req.court_id.replace("-", " ").upper()
-    summary = f"Rezervácia: {court_label} ({req.customer_name})"
-    
-    description_lines = [
-        f"Kurt ID: {req.court_id}",
-        f"Zákazník: {req.customer_name}",
-        f"Telefón: {phone_to_match or 'Neznáme'}",
-        "Kanál: Hlas Telio",
-        f"Poznámka: {req.notes or ''}"
-    ]
-    if user_id:
-        description_lines.append(f"Vlastník ID: {user_id}")
-        
-    description = "\n".join(description_lines)
 
-    from google_calendar import create_calendar_event
-    calendar_event_id = await create_calendar_event(
-        tenant_id=NTC_TENANT_ID,
-        summary=summary,
-        description=description,
-        start_iso=start_dt.isoformat(),
-        end_iso=end_dt.isoformat(),
-        color_id="7"  # Peacock (light blue) for voice reservations
-    )
-
-    # 3. Update database record with calendar_event_id
-    if calendar_event_id:
-        try:
-            supabase.table("bookings") \
-                .update({"calendar_event_id": calendar_event_id}) \
-                .eq("id", db_booking["id"]) \
-                .execute()
-        except Exception as update_err:
-            print(f"[ntc-booking] Failed to update calendar_event_id in DB: {update_err}")
 
     # 4. Send WhatsApp Notification to Customer on Background
     if real_phone:
