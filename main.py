@@ -1,6 +1,7 @@
 import os
 import time
 import datetime
+import json
 import unicodedata
 from difflib import SequenceMatcher
 from html import escape as xml_escape
@@ -1344,20 +1345,120 @@ def format_court_name(court_id: str) -> str:
     return f"Kurt {num}"
 
 
+def _parse_iso_to_utc(iso_str: str) -> datetime.datetime:
+    """
+    Parse a timestamp from Supabase DB and return a UTC datetime.
+    Trusts the timezone offset in the string.
+    Handles: '2026-07-29 10:00:00+00', '2026-07-29T08:00:00.000Z', '2026-07-29T10:00:00+02:00'.
+    If no offset is present, assumes UTC.
+    """
+    clean = iso_str.strip().replace("Z", "+00:00")
+    # Normalize space-separated format to T-separated
+    if "T" not in clean:
+        clean = clean.replace(" ", "T", 1)
+    # Check if there's a timezone offset in the TIME portion (after T)
+    time_part = clean.split("T")[-1] if "T" in clean else clean
+    has_offset = "+" in time_part or (time_part.count("-") > 0 and ":" in time_part.split("-")[-1])
+    if not has_offset:
+        # No timezone info: assume UTC (DB stores timestamptz in UTC)
+        clean += "+00:00"
+    dt = datetime.datetime.fromisoformat(clean)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
+def _parse_elevenlabs_to_utc(iso_str: str) -> datetime.datetime:
+    """
+    Parse a timestamp from ElevenLabs voice assistant and return a UTC datetime.
+    IMPORTANT: ElevenLabs sends local Slovak time (Europe/Bratislava = UTC+2 in summer)
+    but may attach 'Z' or no offset. We ALWAYS treat the numeric time as local time
+    and convert to UTC by subtracting 2 hours.
+    Example: '2026-07-29T10:00:00Z' -> 10:00 local -> 08:00 UTC
+    Example: '2026-07-29T10:00:00'  -> 10:00 local -> 08:00 UTC
+    Example: '2026-07-29T10:00:00+02:00' -> already correct, 10:00+02:00 -> 08:00 UTC
+    """
+    clean = iso_str.strip()
+    # Remove Z suffix - we don't trust it from ElevenLabs
+    clean = clean.rstrip("Z")
+    # Remove any existing offset (we'll add the correct one)
+    # Check for +HH:MM or +HH or -HH:MM patterns at the end
+    if "T" in clean:
+        time_part = clean.split("T")[1]
+        # Find offset position: look for + or - in time part (not in date part)
+        for i in range(len(time_part) - 1, -1, -1):
+            if time_part[i] in ('+', '-') and i > 0:
+                # Found offset, strip it
+                clean = clean.split("T")[0] + "T" + time_part[:i]
+                break
+    # Now clean is like "2026-07-29T10:00:00" - naive local time
+    # Add correct Europe/Bratislava offset (+02:00 CEST / +01:00 CET)
+    # For simplicity, use +02:00 (summer time, which covers most booking season)
+    clean += "+02:00"
+    dt = datetime.datetime.fromisoformat(clean)
+    return dt.astimezone(datetime.timezone.utc)
+
+
+def _get_ntc_busy_courts(start_dt: datetime.datetime, end_dt: datetime.datetime) -> set:
+    """Return court IDs with active bookings overlapping the requested UTC interval."""
+    start_utc = start_dt.astimezone(datetime.timezone.utc)
+    end_utc = end_dt.astimezone(datetime.timezone.utc)
+    try:
+        result = (
+            supabase.table("bookings")
+            .select("court_id, notes, start_at, end_at")
+            .eq("tenant_id", NTC_TENANT_ID)
+            .neq("status", "cancelled")
+            .gte("end_at", (start_utc - datetime.timedelta(days=1)).isoformat())
+            .lte("start_at", (end_utc + datetime.timedelta(days=1)).isoformat())
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Dostupnosť kurtov sa momentálne nedá bezpečne overiť.",
+        ) from exc
+
+    busy_courts = set()
+    for row in result.data or []:
+        start_raw = row.get("start_at")
+        end_raw = row.get("end_at")
+        if not start_raw or not end_raw:
+            continue
+        try:
+            booking_start = _parse_iso_to_utc(start_raw)
+            booking_end = _parse_iso_to_utc(end_raw)
+        except Exception:
+            continue
+        if not (booking_start < end_utc and booking_end > start_utc):
+            continue
+
+        court_id = row.get("court_id")
+        notes = row.get("notes")
+        if not court_id and isinstance(notes, str):
+            try:
+                court_id = json.loads(notes).get("courtId")
+            except Exception:
+                court_id = None
+        if not court_id and isinstance(notes, dict):
+            court_id = notes.get("courtId")
+        if court_id:
+            busy_courts.add(str(court_id).lower().strip())
+
+    return busy_courts
+
+
 @app.post("/api/ntc-check-availability")
 async def ntc_check_availability(req: CheckAvailabilityRequest):
     """
-    Checks Google Calendar events to find free courts for NTC bookings.
+    Checks Supabase bookings table to find free courts for NTC bookings.
     """
     sport_key = normalize_sport(req.sport)
     
-    # Parse dates
+    # Parse dates - ElevenLabs sends local Slovak time (may have Z or no offset)
     try:
-        start_str = req.start_time_iso.replace("Z", "+00:00")
-        if "+" not in start_str and "-" not in start_str.split("T")[-1]:
-            # No timezone offset, assume Europe/Bratislava local time (+02:00 in summer)
-            start_str += "+02:00"
-        start_dt = datetime.datetime.fromisoformat(start_str)
+        start_dt = _parse_elevenlabs_to_utc(req.start_time_iso)
+        print(f"[ntc-check] ElevenLabs raw: '{req.start_time_iso}' -> UTC: {start_dt.isoformat()}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Chybný formát start_time_iso: {e}")
 
@@ -1366,44 +1467,7 @@ async def ntc_check_availability(req: CheckAvailabilityRequest):
 
     print(f"[ntc-check] Checking availability for {sport_key} from {start_dt.isoformat()} to {end_dt.isoformat()}")
 
-    # Buffer of 1 minute to avoid boundaries overlap
-    time_min = (start_dt + datetime.timedelta(minutes=1)).isoformat()
-    time_max = (end_dt - datetime.timedelta(minutes=1)).isoformat()
-    
-    from google_calendar import list_calendar_events
-    events = await list_calendar_events(NTC_TENANT_ID, time_min, time_max)
-
-    busy_courts = set()
-    for event in events:
-        summary = event.get("summary", "")
-        description = event.get("description", "")
-        
-        # Check description and summary for court ID
-        court_id = None
-        
-        # Parse description
-        for line in description.split("\n"):
-            parts = line.split(":")
-            if len(parts) >= 2:
-                key = parts[0].strip().lower()
-                val = ":".join(parts[1:]).strip()
-                if key in ["kurt id", "court id", "courtid", "court"]:
-                    court_id = val.strip().lower()
-                    break
-        
-        if not court_id:
-            import re
-            court_pattern = r"(badminton|squash|tennis|tennis-clay)-\d+"
-            desc_match = re.search(court_pattern, description, re.IGNORECASE)
-            if desc_match:
-                court_id = desc_match.group(0).lower()
-            else:
-                summary_match = re.search(court_pattern, summary, re.IGNORECASE)
-                if summary_match:
-                    court_id = summary_match.group(0).lower()
-
-        if court_id:
-            busy_courts.add(court_id)
+    busy_courts = _get_ntc_busy_courts(start_dt, end_dt)
 
     # Determine court capacity
     # badminton: 14 courts, tennis: 8, squash: 4, clay: 4
@@ -1454,15 +1518,12 @@ async def send_ntc_booking_notification(phone: str, sport: str, court_id: str, s
 
     # 3. Format date & time (in Europe/Bratislava timezone)
     try:
-        # Standard input: e.g. 2026-06-21T10:00:00+02:00 or 2026-06-21T10:00:00
         clean_start = start_iso.replace("Z", "+00:00")
         if "+" not in clean_start and "-" not in clean_start.split("T")[-1]:
-            # No offset, assume Europe/Bratislava local time
             clean_start += "+02:00"
         
         start_dt = datetime.datetime.fromisoformat(clean_start)
         
-        # Date format: e.g., "15. 10. 2026"
         date_formatted = start_dt.strftime("%d. %m. %Y").replace(" 0", " ")
         if date_formatted.startswith("0"):
             date_formatted = date_formatted[1:]
@@ -1476,8 +1537,6 @@ async def send_ntc_booking_notification(phone: str, sport: str, court_id: str, s
 
     msg_body = f"Potvrdzujeme rezerváciu kurtu. Šport: {sport_formatted}, Kurt: {court_formatted}, Dátum: {date_formatted}, Čas: {time_formatted}"
     
-    # Premenné pre novú schválenú šablónu (zakaznik_potvrdenie_ntc):
-    # {{1}} -> Šport, {{2}} -> Kurt, {{3}} -> Dátum, {{4}} -> Čas
     vars_cust = {
         "1": sport_formatted,
         "2": court_formatted,
@@ -1509,7 +1568,6 @@ async def perform_ntc_booking_async(
         db_booking = db_res.data[0]
         print(f"[ntc-booking-async] Rezervácia bola zapísaná pod ID: {db_booking.get('id')}")
         
-        # Send WhatsApp Notification
         if real_phone:
             print(f"[ntc-booking-async] Planujem odoslanie WhatsApp notifikacie na {real_phone}")
             await send_ntc_booking_notification(
@@ -1527,82 +1585,94 @@ async def perform_ntc_booking_async(
 
 @app.post("/api/ntc-create-booking")
 async def ntc_create_booking(req: CreateBookingRequest, background_tasks: BackgroundTasks):
-    """
-    Saves a booking in the Supabase bookings table and Google Calendar.
-    """
+    """Create an NTC booking in Supabase on the first suitable free court."""
     sport_key = normalize_sport(req.sport)
-    
     try:
-        start_str = req.start_time_iso.replace("Z", "+00:00")
-        if "+" not in start_str and "-" not in start_str.split("T")[-1]:
-            # No timezone offset, assume Europe/Bratislava local time (+02:00 in summer)
-            start_str += "+02:00"
-        start_dt = datetime.datetime.fromisoformat(start_str)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Chybný formát start_time_iso: {e}")
+        start_dt = _parse_elevenlabs_to_utc(req.start_time_iso)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Chybný formát start_time_iso: {exc}")
 
     duration = req.duration_minutes or 60
     end_dt = start_dt + datetime.timedelta(minutes=duration)
+    limit = 14 if sport_key == "badminton" else (8 if sport_key == "tennis" else 4)
+    all_sport_courts = [f"{sport_key}-{index}" for index in range(1, limit + 1)]
 
-    # 1. Save to Supabase bookings table
-    import json
-    notes_obj = {
-        "courtId": req.court_id,
-        "source": "voice-assistant",
-        "notes": req.notes or "Rezervácia cez hlasového asistenta"
-    }
+    busy_courts = _get_ntc_busy_courts(start_dt, end_dt)
+    free_courts = [court for court in all_sport_courts if court not in busy_courts]
+    if not free_courts:
+        raise HTTPException(status_code=409, detail=f"Všetky kurty pre {req.sport} v tomto čase sú plne obsadené.")
 
-    # Resolve customer phone number robustly from request and dynamic_variables
+    requested_court = str(req.court_id or "").lower().strip()
+    selected_court = requested_court if requested_court in free_courts else free_courts[0]
+
     req_caller = req.caller_number or ""
-    dyn_vars = req.dynamic_variables or {}
-    dyn_caller = dyn_vars.get("caller_number") or dyn_vars.get("from_number") or ""
-    caller_number = _normalize_phone(req_caller or dyn_caller or "")
+    dynamic_variables = req.dynamic_variables or {}
+    dynamic_caller = dynamic_variables.get("caller_number") or dynamic_variables.get("from_number") or ""
+    caller_number = _normalize_phone(req_caller or dynamic_caller or "")
     payload_phone = _normalize_phone(req.customer_phone or "")
-
     if caller_number and not _is_twilio_owned_number(caller_number):
         real_phone = caller_number
     elif payload_phone and not _is_twilio_owned_number(payload_phone):
         real_phone = payload_phone
     elif _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
         real_phone = _LAST_CALLER_PHONE
-        print(f"[ntc-booking] caller_number chýbalo, používam _LAST_CALLER_PHONE: {real_phone}")
     else:
         real_phone = ""
 
-    # Find matching user in booking_users by phone number
     phone_to_match = real_phone or req.customer_phone or req.caller_number or ""
     user_id = find_user_id_by_phone(phone_to_match)
+    start_at = start_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    end_at = end_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
+    notes_obj = {
+        "courtId": selected_court,
+        "source": "voice-assistant",
+        "notes": req.notes or "Rezervácia cez hlasového asistenta",
+    }
     booking_data = {
         "tenant_id": NTC_TENANT_ID,
+        "court_id": selected_court,
+        "sport": sport_key,
         "customer_name": req.customer_name,
         "customer_phone": phone_to_match,
-        "start_at": start_dt.isoformat(),
-        "end_at": end_dt.isoformat(),
+        "start_at": start_at,
+        "end_at": end_at,
         "status": "confirmed",
-        "notes": json.dumps(notes_obj)
+        "notes": json.dumps(notes_obj),
     }
-
     if user_id:
         booking_data["user_id"] = user_id
-        print(f"[ntc-booking] Associated booking with user_id: {user_id} matching phone: {phone_to_match}")
 
-    # Enqueue database insertion and notification task
-    background_tasks.add_task(
-        perform_ntc_booking_async,
-        booking_data=booking_data,
-        real_phone=real_phone,
-        sport=req.sport,
-        court_id=req.court_id,
-        start_iso=req.start_time_iso,
-        duration=duration
-    )
+    latest_busy = _get_ntc_busy_courts(start_dt, end_dt)
+    if selected_court in latest_busy:
+        latest_free = [court for court in all_sport_courts if court not in latest_busy]
+        if not latest_free:
+            raise HTTPException(status_code=409, detail=f"Všetky kurty pre {req.sport} v tomto čase sú plne obsadené.")
+        selected_court = latest_free[0]
+        notes_obj["courtId"] = selected_court
+        booking_data["court_id"] = selected_court
+        booking_data["notes"] = json.dumps(notes_obj)
 
-    court_name_spoken = format_court_name(req.court_id)
+    db_result = supabase.table("bookings").insert(booking_data).execute()
+    if not db_result.data:
+        raise HTTPException(status_code=500, detail="Rezerváciu sa nepodarilo zapísať.")
+    booking_id = db_result.data[0].get("id")
+
+    if real_phone:
+        background_tasks.add_task(
+            send_ntc_booking_notification,
+            phone=real_phone,
+            sport=req.sport,
+            court_id=selected_court,
+            start_iso=req.start_time_iso,
+            duration=duration,
+        )
+
     return {
         "status": "success",
-        "message": f"Rezervácia pre {req.customer_name} na {court_name_spoken} bola úspešne vytvorená.",
-        "booking_id": "background"
+        "message": f"Rezervácia pre {req.customer_name} na {format_court_name(selected_court)} bola úspešne vytvorená.",
+        "booking_id": booking_id,
+        "court_id": selected_court,
     }
 
 
