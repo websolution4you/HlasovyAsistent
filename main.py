@@ -1469,9 +1469,8 @@ async def ntc_check_availability(req: CheckAvailabilityRequest):
 
     busy_courts = _get_ntc_busy_courts(start_dt, end_dt)
 
-    # Determine court capacity
-    # badminton: 14 courts, tennis: 8, squash: 4, clay: 4
-    limit = 14 if sport_key == "badminton" else (8 if sport_key == "tennis" else 4)
+        # Determine court capacity: badminton 10, tennis 8, squash 4, clay 4.
+    limit = 10 if sport_key == "badminton" else (8 if sport_key == "tennis" else 4)
     all_sport_courts = [f"{sport_key}-{i}" for i in range(1, limit + 1)]
     free_courts = [c for c in all_sport_courts if c not in busy_courts]
 
@@ -1592,9 +1591,9 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Chybný formát start_time_iso: {exc}")
 
-    duration = req.duration_minutes or 60
+        duration = req.duration_minutes or 60
     end_dt = start_dt + datetime.timedelta(minutes=duration)
-    limit = 14 if sport_key == "badminton" else (8 if sport_key == "tennis" else 4)
+    limit = 10 if sport_key == "badminton" else (8 if sport_key == "tennis" else 4)
     all_sport_courts = [f"{sport_key}-{index}" for index in range(1, limit + 1)]
 
     busy_courts = _get_ntc_busy_courts(start_dt, end_dt)
