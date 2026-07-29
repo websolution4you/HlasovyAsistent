@@ -1591,7 +1591,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Chybný formát start_time_iso: {exc}")
 
-        duration = req.duration_minutes or 60
+    duration = req.duration_minutes or 60
     end_dt = start_dt + datetime.timedelta(minutes=duration)
     limit = 10 if sport_key == "badminton" else (8 if sport_key == "tennis" else 4)
     all_sport_courts = [f"{sport_key}-{index}" for index in range(1, limit + 1)]
