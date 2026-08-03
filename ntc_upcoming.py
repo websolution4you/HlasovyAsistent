@@ -1,14 +1,28 @@
+import base64
 import datetime
+import hashlib
+import hmac
 import json
+import os
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 
 class UpcomingBookingsRequest(BaseModel):
     call_sid: str
+
+
+class CancelBookingRequest(BaseModel):
+    call_sid: str
+    booking_reference: str = Field(min_length=1, max_length=128)
+    action: str
+    confirmation_token: str | None = Field(default=None, max_length=2048)
+
+
+_PENDING_CANCELLATION_TTL = datetime.timedelta(minutes=5)
 
 
 _SLOVAK_WEEKDAYS = (
@@ -43,6 +57,50 @@ def _valid_twilio_call_sid(call_sid: str) -> bool:
         and call_sid.startswith("CA")
         and all(character in "0123456789abcdefABCDEF" for character in call_sid[2:])
     )
+
+
+def _confirmation_secret() -> bytes:
+    secret = os.getenv("CORE_SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Bezpečné potvrdenie zrušenia momentálne nie je dostupné.",
+        )
+    return secret.encode("utf-8")
+
+
+def _encode_confirmation_token(payload: dict) -> str:
+    payload_bytes = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    signature = hmac.new(
+        _confirmation_secret(), payload_bytes, hashlib.sha256
+    ).digest()
+    encoded_payload = base64.urlsafe_b64encode(payload_bytes).decode("ascii").rstrip("=")
+    encoded_signature = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    return f"{encoded_payload}.{encoded_signature}"
+
+
+def _decode_confirmation_token(token: str) -> dict | None:
+    try:
+        encoded_payload, encoded_signature = token.split(".", 1)
+        payload_bytes = base64.urlsafe_b64decode(
+            encoded_payload + "=" * (-len(encoded_payload) % 4)
+        )
+        signature = base64.urlsafe_b64decode(
+            encoded_signature + "=" * (-len(encoded_signature) % 4)
+        )
+        expected_signature = hmac.new(
+            _confirmation_secret(), payload_bytes, hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except HTTPException:
+        raise
+    except Exception:
+        return None
 
 
 def _sport_name(sport: str, court_id: str) -> str:
@@ -96,47 +154,58 @@ def _court_id_from_row(row: dict) -> str:
     return ""
 
 
+def _format_booking(row: dict, parse_iso_to_utc) -> tuple[str, dict] | None:
+    try:
+        start_utc = parse_iso_to_utc(str(row.get("start_at") or ""))
+        end_utc = parse_iso_to_utc(str(row.get("end_at") or ""))
+    except Exception:
+        return None
+    if end_utc <= start_utc:
+        return None
+
+    start_local = start_utc.astimezone(_NTC_TIMEZONE)
+    end_local = end_utc.astimezone(_NTC_TIMEZONE)
+    duration_minutes = round((end_utc - start_utc).total_seconds() / 60)
+    court_id = _court_id_from_row(row)
+    sport = _sport_name(str(row.get("sport") or ""), court_id)
+    court = _court_name(court_id)
+    weekday = _SLOVAK_WEEKDAYS[start_local.weekday()]
+    date_text = f"{start_local.day}. {_SLOVAK_MONTHS[start_local.month - 1]}"
+    court_text = ""
+    if court.startswith("kurt číslo "):
+        court_text = f" na kurte číslo {court.rsplit(' ', 1)[-1]}"
+    elif court:
+        court_text = f" na {court}"
+
+    spoken_text = (
+        f"V {weekday} {date_text} od {start_local.strftime('%H:%M')} "
+        f"do {end_local.strftime('%H:%M')} máte rezervovaný {sport}"
+        f"{court_text} {_duration_text(duration_minutes)}."
+    )
+    public_booking = {
+        "booking_reference": str(row.get("id") or ""),
+        "sport": sport,
+        "court": court,
+        "start_at": start_local.isoformat(),
+        "end_at": end_local.isoformat(),
+        "duration_minutes": duration_minutes,
+    }
+    return spoken_text, public_booking
+
+
 def _format_bookings(rows: list[dict], parse_iso_to_utc) -> tuple[str, list[dict]]:
     spoken_bookings = []
     public_bookings = []
 
     for row in rows:
-        try:
-            start_utc = parse_iso_to_utc(str(row.get("start_at") or ""))
-            end_utc = parse_iso_to_utc(str(row.get("end_at") or ""))
-        except Exception:
+        formatted = _format_booking(row, parse_iso_to_utc)
+        if not formatted:
             continue
-        if end_utc <= start_utc:
+        spoken_text, public_booking = formatted
+        if not public_booking["booking_reference"]:
             continue
-
-        start_local = start_utc.astimezone(_NTC_TIMEZONE)
-        end_local = end_utc.astimezone(_NTC_TIMEZONE)
-        duration_minutes = round((end_utc - start_utc).total_seconds() / 60)
-        court_id = _court_id_from_row(row)
-        sport = _sport_name(str(row.get("sport") or ""), court_id)
-        court = _court_name(court_id)
-        weekday = _SLOVAK_WEEKDAYS[start_local.weekday()]
-        date_text = f"{start_local.day}. {_SLOVAK_MONTHS[start_local.month - 1]}"
-        court_text = ""
-        if court.startswith("kurt číslo "):
-            court_text = f" na kurte číslo {court.rsplit(' ', 1)[-1]}"
-        elif court:
-            court_text = f" na {court}"
-
-        spoken_bookings.append(
-            f"V {weekday} {date_text} od {start_local.strftime('%H:%M')} "
-            f"do {end_local.strftime('%H:%M')} máte rezervovaný {sport}"
-            f"{court_text} {_duration_text(duration_minutes)}."
-        )
-        public_bookings.append(
-            {
-                "sport": sport,
-                "court": court,
-                "start_at": start_local.isoformat(),
-                "end_at": end_local.isoformat(),
-                "duration_minutes": duration_minutes,
-            }
-        )
+        spoken_bookings.append(spoken_text)
+        public_bookings.append(public_booking)
 
     count = len(public_bookings)
     if count == 0:
@@ -217,7 +286,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
         now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
             query = main_module.supabase.table("bookings").select(
-                "sport, court_id, start_at, end_at, notes"
+                "id, sport, court_id, start_at, end_at, notes"
             )
             query = query.eq("tenant_id", main_module.NTC_TENANT_ID)
             query = query.eq("user_id", user_id)
@@ -247,4 +316,168 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
             "count": len(bookings),
             "message": message,
             "bookings": bookings,
+        }
+
+    @app.post("/api/ntc-cancel-booking", name="ntc_cancel_booking")
+    async def ntc_cancel_booking(req: CancelBookingRequest):
+        call_sid = str(req.call_sid or "").strip()
+        booking_reference = str(req.booking_reference or "").strip()
+        action = str(req.action or "").strip().lower()
+        confirmation_token = str(req.confirmation_token or "").strip()
+
+        if not _valid_twilio_call_sid(call_sid):
+            raise HTTPException(status_code=400, detail="Neplatný kontext hovoru.")
+        if action not in {"prepare", "confirm"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Action musí byť prepare alebo confirm.",
+            )
+
+        caller_phone = main_module.CALL_CONTEXT.get(call_sid)
+        if not caller_phone:
+            raise HTTPException(
+                status_code=403,
+                detail="Hovor sa nepodarilo bezpečne overiť.",
+            )
+        if not main_module.supabase:
+            raise HTTPException(
+                status_code=503,
+                detail="Rezerváciu momentálne nie je možné zrušiť.",
+            )
+
+        customer_name, user_id = main_module.find_user_name_and_id_by_phone(caller_phone)
+        if not user_id:
+            return {
+                "status": "customer_not_found",
+                "cancelled": False,
+                "message": (
+                    "Rezerváciu sa nepodarilo bezpečne overiť. "
+                    "Obráťte sa, prosím, na recepciu."
+                ),
+            }
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_iso = now_utc.isoformat()
+
+        if action == "prepare":
+            try:
+                query = main_module.supabase.table("bookings").select(
+                    "id, sport, court_id, start_at, end_at, notes"
+                )
+                query = query.eq("id", booking_reference)
+                query = query.eq("tenant_id", main_module.NTC_TENANT_ID)
+                query = query.eq("user_id", user_id)
+                query = query.eq("status", "confirmed")
+                result = query.gte("start_at", now_iso).limit(1).execute()
+            except Exception as exc:
+                print(
+                    f"[ntc-cancel] Prepare query failed for verified "
+                    f"call_sid={call_sid}: {exc}"
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Rezerváciu momentálne nie je možné overiť.",
+                ) from exc
+
+            rows = result.data or []
+            if not rows:
+                return {
+                    "status": "not_cancellable",
+                    "cancelled": False,
+                    "message": (
+                        "Táto rezervácia nepatrí aktuálnemu volajúcemu, "
+                        "už bola zrušená alebo ju nie je možné zrušiť."
+                    ),
+                }
+
+            formatted = _format_booking(rows[0], main_module._parse_iso_to_utc)
+            if not formatted:
+                return {
+                    "status": "not_cancellable",
+                    "cancelled": False,
+                    "message": "Túto rezerváciu nie je možné bezpečne zrušiť.",
+                }
+            spoken_text, booking = formatted
+            expires_at = now_utc + _PENDING_CANCELLATION_TTL
+            confirmation_token = _encode_confirmation_token(
+                {
+                    "call_sid": call_sid,
+                    "booking_reference": booking_reference,
+                    "user_id": str(user_id),
+                    "expires_at": int(expires_at.timestamp()),
+                }
+            )
+
+            confirmation_message = (
+                f"{spoken_text} Naozaj chcete túto rezerváciu zrušiť?"
+            )
+            print(
+                f"[ntc-cancel] Prepared call_sid={call_sid}, "
+                f"customer='{customer_name or ''}', booking={booking_reference}"
+            )
+            return {
+                "status": "awaiting_confirmation",
+                "cancelled": False,
+                "expires_in_seconds": int(_PENDING_CANCELLATION_TTL.total_seconds()),
+                "confirmation_token": confirmation_token,
+                "message": confirmation_message,
+                "booking": booking,
+            }
+
+        token_payload = _decode_confirmation_token(confirmation_token)
+        token_is_valid = bool(
+            token_payload
+            and token_payload.get("call_sid") == call_sid
+            and token_payload.get("booking_reference") == booking_reference
+            and token_payload.get("user_id") == str(user_id)
+            and isinstance(token_payload.get("expires_at"), int)
+            and token_payload["expires_at"] >= int(now_utc.timestamp())
+        )
+
+        if not token_is_valid:
+            return {
+                "status": "confirmation_required",
+                "cancelled": False,
+                "message": (
+                    "Zrušenie nebolo pripravené alebo potvrdenie vypršalo. "
+                    "Najprv je potrebné znova overiť konkrétnu rezerváciu."
+                ),
+            }
+
+        try:
+            query = main_module.supabase.table("bookings").update(
+                {"status": "cancelled"}
+            )
+            query = query.eq("id", booking_reference)
+            query = query.eq("tenant_id", main_module.NTC_TENANT_ID)
+            query = query.eq("user_id", user_id)
+            query = query.eq("status", "confirmed")
+            result = query.gte("start_at", now_iso).execute()
+        except Exception as exc:
+            print(
+                f"[ntc-cancel] Confirm update failed for verified "
+                f"call_sid={call_sid}: {exc}"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Rezerváciu momentálne nie je možné zrušiť.",
+            ) from exc
+
+        if not (result.data or []):
+            return {
+                "status": "not_cancellable",
+                "cancelled": False,
+                "message": (
+                    "Rezervácia už bola zrušená alebo ju už nie je možné zrušiť."
+                ),
+            }
+
+        print(
+            f"[ntc-cancel] Cancelled call_sid={call_sid}, "
+            f"customer='{customer_name or ''}', booking={booking_reference}"
+        )
+        return {
+            "status": "cancelled",
+            "cancelled": True,
+            "message": "Rezervácia bola úspešne zrušená.",
         }
