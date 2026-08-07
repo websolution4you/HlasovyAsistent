@@ -173,7 +173,11 @@ async def _voice_socket(websocket: WebSocket, session: VoiceSession) -> None:
                     return
                 event = message.get("event")
                 if event == "start":
-                    session.stream_sid = message["start"]["streamSid"]
+                    start = message["start"]
+                    session.stream_sid = start["streamSid"]
+                    session.phone = session.main._normalize_phone(
+                        start.get("customParameters", {}).get("phone", "") or session.phone,
+                    )
                     asyncio.create_task(session.speak(GREETING))
                 elif event == "media":
                     await send_scribe_audio(scribe, message["media"]["payload"])
@@ -216,7 +220,6 @@ def register_standalone_voice(app, main_module) -> None:
         phone = main_module._normalize_phone(form.get("From", ""))
         if not re_call_sid(call_sid):
             return Response(status_code=400)
-        main_module.CALL_CONTEXT[call_sid] = phone
         expires = int(time.time()) + 300
         signature = _sign(call_sid, expires, token)
         url = f"{_ws_base(request)}/ws/standalone/{call_sid}/{expires}/{signature}"
@@ -230,11 +233,7 @@ def register_standalone_voice(app, main_module) -> None:
             await websocket.close(code=1008)
             return
         await websocket.accept()
-        phone = main_module.CALL_CONTEXT.get(call_sid, "")
-        try:
-            await _voice_socket(websocket, VoiceSession(websocket, call_sid, phone, main_module))
-        finally:
-            main_module.CALL_CONTEXT.pop(call_sid, None)
+        await _voice_socket(websocket, VoiceSession(websocket, call_sid, "", main_module))
 
 
 def re_call_sid(value: str) -> bool:
