@@ -59,29 +59,66 @@ class VoiceSession:
         self.main = main_module
         self.stream_sid = ""
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        self.turn_lock = asyncio.Lock()
         self.speech_task: asyncio.Task | None = None
+        self.turn_task: asyncio.Task | None = None
         self.last_user_text = ""
         self.last_availability: dict[str, Any] | None = None
+        self.interrupted = False
         self.should_end = False
+        self.closed = False
 
     async def speak(self, text: str) -> None:
-        if not text or not self.stream_sid:
+        if not text or not self.stream_sid or self.closed:
             return
-        self.speech_task = asyncio.create_task(synthesize(text, self.websocket, self.stream_sid))
+        task = asyncio.create_task(synthesize(text, self.websocket, self.stream_sid))
+        self.speech_task = task
         try:
-            await self.speech_task
+            await task
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             print(f"[standalone/tts] synthesis failed: {exc}")
         finally:
-            self.speech_task = None
+            if self.speech_task is task:
+                self.speech_task = None
 
     async def barge_in(self) -> None:
+        self.interrupted = True
         if self.speech_task and not self.speech_task.done():
             self.speech_task.cancel()
-            await self.websocket.send_json({"event": "clear", "streamSid": self.stream_sid})
+            try:
+                await self.websocket.send_json({"event": "clear", "streamSid": self.stream_sid})
+            except Exception:
+                pass
+
+    async def start_turn(self, transcript: str) -> None:
+        if self.closed:
+            return
+        previous = self.turn_task
+        if previous and not previous.done():
+            previous.cancel()
+            await asyncio.gather(previous, return_exceptions=True)
+        self.interrupted = False
+        self.turn_task = asyncio.create_task(self.process_turn(transcript))
+        self.turn_task.add_done_callback(self._turn_finished)
+
+    def _turn_finished(self, task: asyncio.Task) -> None:
+        if self.turn_task is task:
+            self.turn_task = None
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error:
+            print(f"[standalone/turn] failed: {type(error).__name__}")
+
+    async def shutdown(self) -> None:
+        self.closed = True
+        current = asyncio.current_task()
+        tasks = [task for task in (self.speech_task, self.turn_task) if task and task is not current and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run_tool(self, name: str, arguments: dict[str, Any]) -> dict:
         if name == "check_availability":
@@ -122,46 +159,61 @@ class VoiceSession:
         return {"status": "error", "message": "Neznámy nástroj."}
 
     async def process_turn(self, transcript: str) -> None:
-        async with self.turn_lock:
-            self.last_user_text = transcript
-            now = datetime.now(BRATISLAVA)
-            self.messages.append({
-                "role": "user",
-                "content": f"Aktuálny lokálny dátum a čas: {now.isoformat()}. Zákazník povedal: {transcript}",
-            })
-            client, model = llm_client()
-            for _ in range(4):
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=self.messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
-                    temperature=0.2,
-                )
-                message = response.choices[0].message
-                assistant: dict[str, Any] = {"role": "assistant", "content": message.content or ""}
-                if message.tool_calls:
-                    assistant["tool_calls"] = [
-                        {"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}
-                        for call in message.tool_calls
-                    ]
-                self.messages.append(assistant)
-                if message.content:
-                    await self.speak(message.content)
-                if not message.tool_calls:
-                    break
-                for call in message.tool_calls:
-                    try:
-                        result = await self.run_tool(call.function.name, json.loads(call.function.arguments or "{}"))
-                    except Exception as exc:
-                        result = {"status": "error", "message": str(exc)}
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": json.dumps(result, ensure_ascii=False),
-                    })
+        self.last_user_text = transcript
+        now = datetime.now(BRATISLAVA)
+        self.messages.append({
+            "role": "user",
+            "content": f"Aktuálny lokálny dátum a čas: {now.isoformat()}. Zákazník povedal: {transcript}",
+        })
+        client, model = llm_client()
+        for _ in range(4):
+            response = await client.chat.completions.create(
+                model=model,
+                messages=self.messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.2,
+            )
+            if self.interrupted or self.closed:
+                return
+            message = response.choices[0].message
+            assistant: dict[str, Any] = {"role": "assistant", "content": message.content or ""}
+            if message.tool_calls:
+                assistant["tool_calls"] = [
+                    {"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}
+                    for call in message.tool_calls
+                ]
+            self.messages.append(assistant)
+            if message.content:
+                await self.speak(message.content)
+                if self.interrupted or self.closed:
+                    return
+            if not message.tool_calls:
+                return
+            for call in message.tool_calls:
+                try:
+                    result = await self.run_tool(call.function.name, json.loads(call.function.arguments or "{}"))
+                except Exception as exc:
+                    result = {"status": "error", "message": str(exc)}
+                status = result.get("status", "unknown")
+                print(f"[standalone/tool] name={call.function.name} status={status}")
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+                if status == "confirmation_required":
+                    if not message.content:
+                        await self.speak("Prosím, potvrďte rezerváciu slovom áno.")
+                    return
+                if status == "availability_required":
+                    await self.speak("Termín musím pred rezerváciou znovu overiť.")
+                    return
             if self.should_end:
+                await asyncio.sleep(1)
+                self.closed = True
                 await self.websocket.close(code=1000)
+                return
 
 
 async def _voice_socket(websocket: WebSocket, session: VoiceSession) -> None:
@@ -194,17 +246,20 @@ async def _voice_socket(websocket: WebSocket, session: VoiceSession) -> None:
                 if kind == "partial_transcript" and text:
                     await session.barge_in()
                 elif kind == "committed_transcript" and text:
-                    asyncio.create_task(session.process_turn(text))
+                    await session.start_turn(text)
                 elif kind in {"auth_error", "quota_exceeded", "transcriber_error", "error"}:
                     raise RuntimeError(f"ElevenLabs Scribe error: {kind}")
 
         tasks = {asyncio.create_task(inbound()), asyncio.create_task(transcripts())}
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            task.result()
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                task.result()
+        finally:
+            await session.shutdown()
 
 
 def register_standalone_voice(app, main_module) -> None:

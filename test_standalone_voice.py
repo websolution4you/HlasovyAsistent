@@ -1,3 +1,4 @@
+import asyncio
 import time
 import unittest
 from types import SimpleNamespace
@@ -15,6 +16,35 @@ class StandaloneVoiceSafetyTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch.dict("os.environ", environment, clear=True):
             self.assertEqual(elevenlabs_key(), "standalone-key")
+
+    async def test_barge_in_cancels_speech_and_clears_twilio_audio(self):
+        websocket = AsyncMock()
+        session = VoiceSession(websocket, "CA123456789012345678", "+421900000000", SimpleNamespace())
+        session.stream_sid = "MZstream"
+        session.speech_task = asyncio.create_task(asyncio.sleep(10))
+
+        await session.barge_in()
+        await asyncio.gather(session.speech_task, return_exceptions=True)
+
+        self.assertTrue(session.interrupted)
+        self.assertTrue(session.speech_task.cancelled())
+        websocket.send_json.assert_awaited_once_with({"event": "clear", "streamSid": "MZstream"})
+
+    async def test_new_turn_cancels_previous_turn_instead_of_queueing(self):
+        session = VoiceSession(AsyncMock(), "CA123456789012345678", "+421900000000", SimpleNamespace())
+        started = asyncio.Event()
+
+        async def slow_turn(_):
+            started.set()
+            await asyncio.sleep(10)
+
+        with patch.object(session, "process_turn", side_effect=slow_turn):
+            await session.start_turn("prvý vstup")
+            first = session.turn_task
+            await started.wait()
+            await session.start_turn("nový vstup")
+            self.assertTrue(first.cancelled())
+            await session.shutdown()
 
     async def test_create_requires_explicit_confirmation(self):
         session = VoiceSession(AsyncMock(), "CA123456789012345678", "+421900000000", SimpleNamespace())
