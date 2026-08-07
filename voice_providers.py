@@ -10,7 +10,7 @@ from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 
 def elevenlabs_key() -> str:
-    return os.getenv("ELEVENLABS_NTC_API_KEY") or os.environ["ELEVENLABS_API_KEY"]
+    return os.getenv("ELEVENLABS_API_KEY") or os.environ["ELEVENLABS_NTC_API_KEY"]
 
 
 def llm_client():
@@ -48,7 +48,8 @@ async def synthesize(text: str, websocket: WebSocket, stream_sid: str) -> None:
             headers={"xi-api-key": elevenlabs_key()},
             json=body,
         ) as response:
-            response.raise_for_status()
+            if not response.is_success:
+                raise RuntimeError(f"ELEVENLABS_TTS_HTTP_{response.status_code}")
             buffer = b""
             async for chunk in response.aiter_bytes():
                 buffer += chunk

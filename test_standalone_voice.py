@@ -4,9 +4,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from standalone_voice import VoiceSession, _sign, _valid_token
+from voice_providers import elevenlabs_key
 
 
 class StandaloneVoiceSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def test_standalone_key_has_priority_over_legacy_agent_key(self):
+        environment = {
+            "ELEVENLABS_API_KEY": "standalone-key",
+            "ELEVENLABS_NTC_API_KEY": "legacy-agent-key",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            self.assertEqual(elevenlabs_key(), "standalone-key")
+
     async def test_create_requires_explicit_confirmation(self):
         session = VoiceSession(AsyncMock(), "CA123456789012345678", "+421900000000", SimpleNamespace())
         session.last_availability = {

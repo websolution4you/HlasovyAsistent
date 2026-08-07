@@ -73,6 +73,8 @@ class VoiceSession:
             await self.speech_task
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            print(f"[standalone/tts] synthesis failed: {exc}")
         finally:
             self.speech_task = None
 
