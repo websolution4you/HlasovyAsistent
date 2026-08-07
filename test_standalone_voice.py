@@ -46,6 +46,30 @@ class StandaloneVoiceSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(first.cancelled())
             await session.shutdown()
 
+    async def test_short_yes_confirms_pending_booking_without_llm(self):
+        websocket = AsyncMock()
+        session = VoiceSession(websocket, "CA123456789012345678", "+421900000000", SimpleNamespace())
+        session.stream_sid = "MZstream"
+        session.pending_booking = {
+            "sport": "badminton",
+            "court_id": "badminton-1",
+            "customer_name": "Ján Novák",
+            "start_time_iso": "2026-08-10T10:00:00",
+            "duration_minutes": 60,
+        }
+        with (
+            patch.object(session, "run_tool", AsyncMock(return_value={"status": "success"})) as run_tool,
+            patch.object(session, "speak", AsyncMock()) as speak,
+            patch("standalone_voice.llm_client") as llm,
+            patch("standalone_voice.asyncio.sleep", AsyncMock()),
+        ):
+            await session.process_turn("Áno.")
+
+        run_tool.assert_awaited_once_with("create_booking", session.pending_booking)
+        speak.assert_awaited_once()
+        llm.assert_not_called()
+        websocket.close.assert_awaited_once_with(code=1000)
+
     async def test_create_requires_explicit_confirmation(self):
         session = VoiceSession(AsyncMock(), "CA123456789012345678", "+421900000000", SimpleNamespace())
         session.last_availability = {

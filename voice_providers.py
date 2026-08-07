@@ -23,7 +23,7 @@ def llm_client():
     return AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"]), os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
-async def synthesize(text: str, websocket: WebSocket, stream_sid: str) -> None:
+async def synthesize(text: str, websocket: WebSocket, stream_sid: str, on_first_audio=None) -> None:
     voice_id = os.environ["ELEVENLABS_VOICE_ID"]
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
     params = {
@@ -51,10 +51,15 @@ async def synthesize(text: str, websocket: WebSocket, stream_sid: str) -> None:
             if not response.is_success:
                 raise RuntimeError(f"ELEVENLABS_TTS_HTTP_{response.status_code}")
             buffer = b""
+            first_audio_sent = False
             async for chunk in response.aiter_bytes():
                 buffer += chunk
                 complete = len(buffer) - (len(buffer) % 160)
                 for offset in range(0, complete, 160):
+                    if not first_audio_sent:
+                        first_audio_sent = True
+                        if on_first_audio:
+                            on_first_audio()
                     await websocket.send_json({
                         "event": "media",
                         "streamSid": stream_sid,
@@ -66,7 +71,7 @@ async def synthesize(text: str, websocket: WebSocket, stream_sid: str) -> None:
 async def scribe_session() -> AsyncIterator:
     query = (
         "model_id=scribe_v2_realtime&language_code=sk&audio_format=ulaw_8000"
-        "&commit_strategy=vad&vad_silence_threshold_secs=0.8&vad_threshold=0.4"
+        "&commit_strategy=vad&vad_silence_threshold_secs=0.35&vad_threshold=0.4"
         "&min_speech_duration_ms=100&min_silence_duration_ms=100"
     )
     return websockets.connect(

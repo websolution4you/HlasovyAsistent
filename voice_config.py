@@ -1,7 +1,11 @@
 import re
 
 GREETING = "Dobrý deň, vitajte v našom tenisovom centre. Som vaša hlasová asistentka. Čo môžem pre vás urobiť?"
-AFFIRMATIVE = re.compile(r"^\s*(áno|ano|áno,?\s+potvrdzujem|ano,?\s+potvrdzujem|potvrdzujem)\b", re.I)
+AFFIRMATIVE = re.compile(
+    r"^\s*(áno|ano)(,?\s+potvrdzujem)?\s*[.!]?\s*$|"
+    r"^\s*(potvrdzujem|súhlasím|suhlasim|môže byť|moze byt|jasné|jasne)\s*[.!]?\s*$",
+    re.I,
+)
 SYSTEM_PROMPT = """Si profesionálna slovenská hlasová asistentka tenisového centra v Bratislave.
 Obsluhuješ iba nové telefonické rezervácie pre návštevníkov bez členského účtu.
 Hovor výhradne po slovensky, stručne a prirodzene. Polož vždy iba jednu otázku.

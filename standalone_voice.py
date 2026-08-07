@@ -63,14 +63,20 @@ class VoiceSession:
         self.turn_task: asyncio.Task | None = None
         self.last_user_text = ""
         self.last_availability: dict[str, Any] | None = None
+        self.pending_booking: dict[str, Any] | None = None
         self.interrupted = False
         self.should_end = False
         self.closed = False
 
-    async def speak(self, text: str) -> None:
+    async def speak(self, text: str, turn_started: float | None = None) -> None:
         if not text or not self.stream_sid or self.closed:
             return
-        task = asyncio.create_task(synthesize(text, self.websocket, self.stream_sid))
+
+        def first_audio() -> None:
+            if turn_started is not None:
+                print(f"[standalone/latency] final_to_first_audio_ms={int((time.perf_counter() - turn_started) * 1000)}")
+
+        task = asyncio.create_task(synthesize(text, self.websocket, self.stream_sid, first_audio))
         self.speech_task = task
         try:
             await task
@@ -133,6 +139,7 @@ class VoiceSession:
             return result
         if name == "create_booking":
             if not AFFIRMATIVE.search(self.last_user_text):
+                self.pending_booking = dict(arguments)
                 return {"status": "confirmation_required", "message": "Zákazník rezerváciu výslovne nepotvrdil."}
             if not self.last_availability or self.last_availability.get("status") != "available":
                 return {"status": "availability_required", "message": "Termín nebol bezpečne overený."}
@@ -152,6 +159,7 @@ class VoiceSession:
                 int(arguments["duration_minutes"]),
             )
             self.last_availability = None
+            self.pending_booking = None
             return result
         if name == "end_call":
             self.should_end = True
@@ -159,7 +167,19 @@ class VoiceSession:
         return {"status": "error", "message": "Neznámy nástroj."}
 
     async def process_turn(self, transcript: str) -> None:
+        turn_started = time.perf_counter()
         self.last_user_text = transcript
+        if self.pending_booking and AFFIRMATIVE.search(transcript):
+            print("[standalone/turn] confirmation_fast_path=true")
+            result = await self.run_tool("create_booking", self.pending_booking)
+            if result.get("status") == "success":
+                await self.speak("Rezervácia bola úspešne vytvorená. Prajem pekný deň, dovidenia.", turn_started)
+                await asyncio.sleep(0.5)
+                self.closed = True
+                await self.websocket.close(code=1000)
+            else:
+                await self.speak("Rezerváciu sa nepodarilo vytvoriť. Termín musím znovu overiť.", turn_started)
+            return
         now = datetime.now(BRATISLAVA)
         self.messages.append({
             "role": "user",
@@ -167,6 +187,7 @@ class VoiceSession:
         })
         client, model = llm_client()
         for _ in range(4):
+            llm_started = time.perf_counter()
             response = await client.chat.completions.create(
                 model=model,
                 messages=self.messages,
@@ -174,6 +195,7 @@ class VoiceSession:
                 tool_choice="auto",
                 temperature=0.2,
             )
+            print(f"[standalone/latency] llm_ms={int((time.perf_counter() - llm_started) * 1000)}")
             if self.interrupted or self.closed:
                 return
             message = response.choices[0].message
@@ -185,7 +207,7 @@ class VoiceSession:
                 ]
             self.messages.append(assistant)
             if message.content:
-                await self.speak(message.content)
+                await self.speak(message.content, turn_started)
                 if self.interrupted or self.closed:
                     return
             if not message.tool_calls:
