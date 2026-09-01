@@ -2,6 +2,7 @@ import os
 import time
 import datetime
 import json
+import uuid
 import unicodedata
 from difflib import SequenceMatcher
 from html import escape as xml_escape
@@ -1619,7 +1620,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
         real_phone = ""
 
     phone_to_match = real_phone or req.customer_phone or req.caller_number or ""
-    user_id = find_user_id_by_phone(phone_to_match)
+    user_name, user_id = find_user_name_and_id_by_phone(phone_to_match)
     start_at = start_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     end_at = end_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
@@ -1628,19 +1629,6 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
         "source": "voice-assistant",
         "notes": req.notes or "Rezervácia cez hlasového asistenta",
     }
-    booking_data = {
-        "tenant_id": NTC_TENANT_ID,
-        "court_id": selected_court,
-        "sport": sport_key,
-        "customer_name": req.customer_name,
-        "customer_phone": phone_to_match,
-        "start_at": start_at,
-        "end_at": end_at,
-        "status": "confirmed",
-        "notes": json.dumps(notes_obj),
-    }
-    if user_id:
-        booking_data["user_id"] = user_id
 
     latest_busy = _get_ntc_busy_courts(start_dt, end_dt)
     if selected_court in latest_busy:
@@ -1649,13 +1637,63 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
             raise HTTPException(status_code=409, detail=f"Všetky kurty pre {req.sport} v tomto čase sú plne obsadené.")
         selected_court = latest_free[0]
         notes_obj["courtId"] = selected_court
-        booking_data["court_id"] = selected_court
-        booking_data["notes"] = json.dumps(notes_obj)
 
-    db_result = supabase.table("bookings").insert(booking_data).execute()
-    if not db_result.data:
-        raise HTTPException(status_code=500, detail="Rezerváciu sa nepodarilo zapísať.")
-    booking_id = db_result.data[0].get("id")
+    charged_eur = 0.0
+    balance_eur = None
+
+    if user_id:
+        # Registrovaný člen NTC: stiahne kredit cez overenú SQL RPC funkciu
+        try:
+            print(f"[ntc-create-booking] Volám wallet_create_ntc_booking pre člena {user_name} ({user_id}) na kurt {selected_court}")
+            rpc_payload = {
+                "p_user_id": user_id,
+                "p_court_id": selected_court,
+                "p_sport": sport_key,
+                "p_customer_name": req.customer_name or user_name or "Člen NTC",
+                "p_customer_phone": phone_to_match,
+                "p_start_at": start_at,
+                "p_end_at": end_at,
+                "p_notes": json.dumps(notes_obj),
+                "p_idempotency_key": f"voice-{uuid.uuid4()}",
+            }
+            rpc_res = supabase.rpc("wallet_create_ntc_booking", rpc_payload).execute()
+            if not rpc_res.data or len(rpc_res.data) == 0:
+                raise Exception("Funkcia wallet_create_ntc_booking nevrátila žiadne dáta.")
+
+            result_row = rpc_res.data[0]
+            booking_id = result_row.get("booking_id")
+            charged_eur = float(result_row.get("charged_eur") or 0.0)
+            balance_eur = float(result_row.get("balance_eur") or 0.0)
+            print(f"[ntc-create-booking] Peňaženka člena úspešne spracovaná: stiahnuté {charged_eur} €, zostatok {balance_eur} €")
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if "insufficient wallet balance" in err_str:
+                raise HTTPException(
+                    status_code=402,
+                    detail="Váš zostatok kreditu na členskej karte je nedostatočný pre túto rezerváciu. Prosím, dobite si kredit."
+                )
+            if "no longer available" in err_str:
+                raise HTTPException(status_code=409, detail=f"Vybraný kurt {req.sport} je už obsadený.")
+            print(f"[ntc-create-booking] Chyba pri peňaženkovej rezervácii člena: {exc}")
+            raise HTTPException(status_code=500, detail=f"Chyba pri vytvorení rezervácie cez kredit: {exc}")
+    else:
+        # Neregistrovaný volajúci z ulice: priamy zápis bez peňaženky
+        print(f"[ntc-create-booking] Neregistrovaný volajúci (z ulice): vytváram bežnú rezerváciu na meno {req.customer_name}")
+        booking_data = {
+            "tenant_id": NTC_TENANT_ID,
+            "court_id": selected_court,
+            "sport": sport_key,
+            "customer_name": req.customer_name,
+            "customer_phone": phone_to_match,
+            "start_at": start_at,
+            "end_at": end_at,
+            "status": "confirmed",
+            "notes": json.dumps(notes_obj),
+        }
+        db_result = supabase.table("bookings").insert(booking_data).execute()
+        if not db_result.data:
+            raise HTTPException(status_code=500, detail="Rezerváciu sa nepodarilo zapísať.")
+        booking_id = db_result.data[0].get("id")
 
     if real_phone:
         background_tasks.add_task(
@@ -1667,11 +1705,17 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
             duration=duration,
         )
 
+    response_msg = f"Rezervácia pre {req.customer_name or user_name} na {format_court_name(selected_court)} bola úspešne vytvorená."
+    if user_id and charged_eur > 0:
+        response_msg += f" Z vášho kreditu bolo stiahnutých {charged_eur:.2f} €. Aktuálny zostatok: {balance_eur:.2f} €."
+
     return {
         "status": "success",
-        "message": f"Rezervácia pre {req.customer_name} na {format_court_name(selected_court)} bola úspešne vytvorená.",
+        "message": response_msg,
         "booking_id": booking_id,
         "court_id": selected_court,
+        "charged_eur": charged_eur,
+        "balance_eur": balance_eur,
     }
 
 
