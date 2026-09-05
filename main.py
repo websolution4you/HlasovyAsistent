@@ -1029,7 +1029,10 @@ async def prompt_config(request: Request):
         "client_name": client_name,
         "client_salutation": client_salutation,
     }
-    return {"dynamic_variables": dynamic_variables}
+    return {
+        "type": "conversation_initiation_client_data",
+        "dynamic_variables": dynamic_variables,
+    }
 
 
 
