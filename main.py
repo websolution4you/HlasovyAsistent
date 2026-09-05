@@ -141,6 +141,7 @@ class CreateBookingRequest(BaseModel):
     notes: Optional[str] = None
     caller_number: Optional[str] = None
     call_context: Optional[str] = None
+    call_sid: Optional[str] = None
     dynamic_variables: Optional[dict] = None
 
 
@@ -1668,9 +1669,10 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
     context_token = req.call_context or dynamic_variables.get("call_context") or ""
     context = verify_call_context(context_token) if context_token else None
     if context_token and not context:
+        print(f"[ntc-create-booking] REJECT 403: call_context token verification failed: '{context_token[:20]}...'")
         raise HTTPException(status_code=403, detail="Kontext hovoru je neplatný alebo vypršal.")
 
-    legacy_call_sid = str(dynamic_variables.get("call_sid") or "").strip()
+    legacy_call_sid = str(req.call_sid or dynamic_variables.get("call_sid") or "").strip()
     if not context and (
         len(legacy_call_sid) == 34
         and legacy_call_sid.startswith("CA")
@@ -1684,6 +1686,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
                 "conversation_id": "",
                 "provider": "twilio",
             }
+            print(f"[ntc-create-booking] Resolved Twilio legacy context for call_sid={legacy_call_sid}, phone={legacy_phone}")
 
     trusted_caller = _normalize_phone(context.get("caller_phone", "")) if context else ""
     dynamic_caller = dynamic_variables.get("caller_number") or dynamic_variables.get("from_number") or ""
@@ -1700,6 +1703,11 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
 
     phone_to_match = real_phone or req.customer_phone or req.caller_number or ""
     user_name, user_id = find_user_name_and_id_by_phone(phone_to_match)
+    print(
+        f"[ntc-create-booking] sport={req.sport}, court={selected_court}, "
+        f"phone_to_match='{phone_to_match}', member='{user_name}' ({user_id}), "
+        f"has_context={bool(context)}, has_token={bool(context_token)}, call_sid='{legacy_call_sid}'"
+    )
     start_at = start_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     end_at = end_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
@@ -1722,6 +1730,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
 
     if user_id:
         if not context:
+            print(f"[ntc-create-booking] REJECT 403: Member '{user_name}' ({user_id}) cannot be charged without verified call context or valid Twilio call_sid.")
             raise HTTPException(
                 status_code=403,
                 detail="Člena sa nepodarilo bezpečne overiť v kontexte hovoru.",
