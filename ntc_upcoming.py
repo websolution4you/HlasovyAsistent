@@ -16,11 +16,13 @@ from call_context import verify_call_context
 class UpcomingBookingsRequest(BaseModel):
     call_sid: str = ""
     call_context: str = ""
+    dynamic_variables: dict | None = None
 
 
 class CancelBookingRequest(BaseModel):
     call_sid: str = ""
     call_context: str = ""
+    dynamic_variables: dict | None = None
 
     booking_reference: str = Field(min_length=1, max_length=128)
     action: str
@@ -66,6 +68,11 @@ def _valid_twilio_call_sid(call_sid: str) -> bool:
 
 def _resolve_verified_call(req, main_module) -> tuple[str, str]:
     context_token = str(getattr(req, "call_context", "") or "").strip()
+    if not context_token:
+        dyn = getattr(req, "dynamic_variables", None) or {}
+        if isinstance(dyn, dict):
+            context_token = str(dyn.get("call_context", "") or "").strip()
+
     if context_token:
         context = verify_call_context(context_token)
         if not context:
@@ -76,6 +83,11 @@ def _resolve_verified_call(req, main_module) -> tuple[str, str]:
         return str(context["call_id"]), str(context["caller_phone"])
 
     call_sid = str(getattr(req, "call_sid", "") or "").strip()
+    if not call_sid:
+        dyn = getattr(req, "dynamic_variables", None) or {}
+        if isinstance(dyn, dict):
+            call_sid = str(dyn.get("call_sid", "") or "").strip()
+
     if not _valid_twilio_call_sid(call_sid):
         raise HTTPException(status_code=400, detail="Neplatný kontext hovoru.")
     caller_phone = main_module.CALL_CONTEXT.get(call_sid)
@@ -339,6 +351,12 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
 
     @app.post("/api/ntc-cancel-booking", name="ntc_cancel_booking")
     async def ntc_cancel_booking(req: CancelBookingRequest):
+        print(
+            f"[ntc-cancel] Incoming request: action='{req.action}', "
+            f"booking_reference='{req.booking_reference}', "
+            f"has_call_context={bool(req.call_context)}, "
+            f"has_dyn_context={bool((req.dynamic_variables or {}).get('call_context'))}"
+        )
         call_id, caller_phone = _resolve_verified_call(req, main_module)
         booking_reference = str(req.booking_reference or "").strip()
         action = str(req.action or "").strip().lower()
