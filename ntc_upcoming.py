@@ -10,15 +10,21 @@ from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from call_context import verify_call_context
+
 
 class UpcomingBookingsRequest(BaseModel):
     call_sid: str = ""
+    call_context: str = ""
     caller_number: str | None = None
     customer_phone: str | None = None
+    dynamic_variables: dict | None = None
 
 
 class CancelBookingRequest(BaseModel):
     call_sid: str = ""
+    call_context: str = ""
+    dynamic_variables: dict | None = None
     booking_reference: str = Field(min_length=1, max_length=128)
     action: str = "prepare"
     confirmation_token: str | None = Field(default=None, max_length=2048)
@@ -61,6 +67,39 @@ def _valid_twilio_call_sid(call_sid: str) -> bool:
         and call_sid.startswith("CA")
         and all(character in "0123456789abcdefABCDEF" for character in call_sid[2:])
     )
+
+
+def _resolve_verified_call(req, main_module) -> tuple[str, str]:
+    context_token = str(getattr(req, "call_context", "") or "").strip()
+    if not context_token:
+        dyn = getattr(req, "dynamic_variables", None) or {}
+        if isinstance(dyn, dict):
+            context_token = str(dyn.get("call_context", "") or "").strip()
+
+    if context_token:
+        context = verify_call_context(context_token)
+        if not context:
+            raise HTTPException(
+                status_code=403,
+                detail="Kontext hovoru je neplatný alebo vypršal.",
+            )
+        return str(context["call_id"]), str(context["caller_phone"])
+
+    call_sid = str(getattr(req, "call_sid", "") or "").strip()
+    if not call_sid:
+        dyn = getattr(req, "dynamic_variables", None) or {}
+        if isinstance(dyn, dict):
+            call_sid = str(dyn.get("call_sid", "") or "").strip()
+
+    if not _valid_twilio_call_sid(call_sid):
+        raise HTTPException(status_code=400, detail="Neplatný kontext hovoru.")
+    caller_phone = main_module.CALL_CONTEXT.get(call_sid)
+    if not caller_phone:
+        raise HTTPException(
+            status_code=403,
+            detail="Hovor sa nepodarilo bezpečne overiť.",
+        )
+    return call_sid, caller_phone
 
 
 def _confirmation_secret() -> bytes:
@@ -257,23 +296,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
 
     @app.post("/api/ntc-upcoming-bookings", name="ntc_upcoming_bookings")
     async def ntc_upcoming_bookings(req: UpcomingBookingsRequest):
-        call_sid = str(req.call_sid or "").strip()
-        if not _valid_twilio_call_sid(call_sid):
-            raise HTTPException(status_code=400, detail="Neplatný kontext hovoru.")
-
-        caller_phone = main_module.CALL_CONTEXT.get(call_sid)
-        if not caller_phone and getattr(main_module, "_LAST_CALLER_PHONE", None):
-            caller_phone = main_module._LAST_CALLER_PHONE
-        if not caller_phone and getattr(req, "caller_number", None):
-            caller_phone = main_module._normalize_phone(req.caller_number)
-        if not caller_phone and getattr(req, "customer_phone", None):
-            caller_phone = main_module._normalize_phone(req.customer_phone)
-
-        if not caller_phone:
-            raise HTTPException(
-                status_code=403,
-                detail="Hovor sa nepodarilo bezpečne overiť.",
-            )
+        call_id, caller_phone = _resolve_verified_call(req, main_module)
 
         if not main_module.supabase:
             raise HTTPException(
@@ -307,7 +330,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
         except Exception as exc:
             print(
                 f"[ntc-upcoming] Supabase query failed for verified "
-                f"call_sid={call_sid}: {exc}"
+                f"call_id={call_id}: {exc}"
             )
             raise HTTPException(
                 status_code=503,
@@ -318,7 +341,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
             result.data or [], main_module._parse_iso_to_utc
         )
         print(
-            f"[ntc-upcoming] Verified call_sid={call_sid}, "
+            f"[ntc-upcoming] Verified call_id={call_id}, "
             f"customer='{customer_name or ''}', returned_bookings={len(bookings)}"
         )
         return {
@@ -331,32 +354,24 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
 
     @app.post("/api/ntc-cancel-booking", name="ntc_cancel_booking")
     async def ntc_cancel_booking(req: CancelBookingRequest):
-        call_sid = str(req.call_sid or "").strip()
+        print(
+            f"[ntc-cancel] Incoming request: action='{req.action}', "
+            f"booking_reference='{req.booking_reference}', "
+            f"has_call_context={bool(req.call_context)}, "
+            f"has_dyn_context={bool((req.dynamic_variables or {}).get('call_context'))}"
+        )
+        call_id, caller_phone = _resolve_verified_call(req, main_module)
         booking_reference = str(req.booking_reference or "").strip()
         action = str(req.action or "").strip().lower()
         confirmation_token = str(req.confirmation_token or "").strip()
 
-        if not _valid_twilio_call_sid(call_sid):
-            raise HTTPException(status_code=400, detail="Neplatný kontext hovoru.")
         if action not in {"prepare", "confirm"}:
             raise HTTPException(
                 status_code=400,
                 detail="Action musí byť prepare alebo confirm.",
             )
 
-        caller_phone = main_module.CALL_CONTEXT.get(call_sid)
-        if not caller_phone and getattr(main_module, "_LAST_CALLER_PHONE", None):
-            caller_phone = main_module._LAST_CALLER_PHONE
-        if not caller_phone and getattr(req, "caller_number", None):
-            caller_phone = main_module._normalize_phone(req.caller_number)
-        if not caller_phone and getattr(req, "customer_phone", None):
-            caller_phone = main_module._normalize_phone(req.customer_phone)
 
-        if not caller_phone:
-            raise HTTPException(
-                status_code=403,
-                detail="Hovor sa nepodarilo bezpečne overiť.",
-            )
         if not main_module.supabase:
             raise HTTPException(
                 status_code=503,
@@ -390,7 +405,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
             except Exception as exc:
                 print(
                     f"[ntc-cancel] Prepare query failed for verified "
-                    f"call_sid={call_sid}: {exc}"
+                    f"call_id={call_id}: {exc}"
                 )
                 raise HTTPException(
                     status_code=503,
@@ -419,7 +434,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
             expires_at = now_utc + _PENDING_CANCELLATION_TTL
             confirmation_token = _encode_confirmation_token(
                 {
-                    "call_sid": call_sid,
+                    "call_id": call_id,
                     "booking_reference": booking_reference,
                     "user_id": str(user_id),
                     "expires_at": int(expires_at.timestamp()),
@@ -454,7 +469,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
                 )
 
             print(
-                f"[ntc-cancel] Prepared call_sid={call_sid}, "
+f"[ntc-cancel] Prepared call_id={call_id}, "
                 f"customer='{customer_name or ''}', booking={booking_reference}, refund_est={booking_price}"
             )
             return {
@@ -470,7 +485,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
         token_payload = _decode_confirmation_token(confirmation_token)
         token_is_valid = bool(
             token_payload
-            and token_payload.get("call_sid") == call_sid
+            and token_payload.get("call_id") == call_id
             and token_payload.get("booking_reference") == booking_reference
             and token_payload.get("user_id") == str(user_id)
             and isinstance(token_payload.get("expires_at"), int)
@@ -510,7 +525,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
                 }
         except Exception as exc:
             print(
-                f"[ntc-cancel] Confirm check failed for verified call_sid={call_sid}: {exc}"
+f"[ntc-cancel] Confirm check failed for verified call_id={call_id}: {exc}"
             )
             raise HTTPException(
                 status_code=503,
@@ -572,7 +587,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
             message = "Rezervácia bola úspešne zrušená."
 
         print(
-            f"[ntc-cancel] Cancelled call_sid={call_sid}, "
+f"[ntc-cancel] Cancelled call_id={call_id}, "
             f"customer='{customer_name or ''}', booking={booking_reference}, "
             f"refunded={refunded}, refunded_eur={refunded_eur}, balance_eur={balance_eur}"
         )

@@ -1,8 +1,8 @@
 import os
 import time
 import datetime
+import hmac
 import json
-import uuid
 import unicodedata
 from difflib import SequenceMatcher
 from html import escape as xml_escape
@@ -14,6 +14,9 @@ from pydantic import BaseModel
 from typing import Optional, Tuple
 from supabase import create_client, Client
 from dotenv import load_dotenv
+
+from call_context import booking_operation_id, create_call_context, verify_call_context
+
 
 # Nacitanie environment premennych (uzitocne pre lokalny vyvoj)
 load_dotenv()
@@ -137,7 +140,10 @@ class CreateBookingRequest(BaseModel):
     duration_minutes: Optional[int] = 60
     notes: Optional[str] = None
     caller_number: Optional[str] = None
+    call_context: Optional[str] = None
+    call_sid: Optional[str] = None
     dynamic_variables: Optional[dict] = None
+
 
 
 
@@ -838,7 +844,7 @@ async def twilio_voice_webhook(request: Request):
         el_api_key = (os.getenv("ELEVENLABS_NTC_API_KEY") or "").strip() if is_ntc else ""
         if not el_api_key:
             el_api_key = ELEVENLABS_API_KEY
-            
+
         client_name = ""
         client_salutation = ""
         if is_ntc and customer_number:
@@ -846,15 +852,31 @@ async def twilio_voice_webhook(request: Request):
             client_name = client_name or ""
             if client_name:
                 client_salutation = format_client_salutation(client_name)
-            print(f"[twilio/voice] Resolved NTC customer name: {client_name}, salutation: {client_salutation}")
+            print(
+                f"[twilio/voice] Resolved NTC customer name: {client_name}, "
+                f"salutation: {client_salutation}"
+            )
+
+        call_context = ""
+        if customer_number and call_sid:
+            try:
+                call_context = create_call_context(
+                    caller_phone=customer_number,
+                    call_id=call_sid,
+                    provider="twilio",
+                )
+            except RuntimeError as exc:
+                print(f"[twilio/voice] Call context unavailable: {exc}")
+
 
         print(f"[twilio/voice] Creating ElevenLabs client using {'NTC' if (is_ntc and os.getenv('ELEVENLABS_NTC_API_KEY')) else 'default'} API key.")
         client = ElevenLabs(api_key=el_api_key)
+
         twiml = client.conversational_ai.twilio.register_call(
             agent_id=agent_id,
             from_number=from_number,
             to_number=to_number,
-            direction="inbound",
+                        direction="inbound",
             conversation_initiation_client_data={
                 "dynamic_variables": {
                     "menu": menu,
@@ -862,6 +884,9 @@ async def twilio_voice_webhook(request: Request):
                     "from_number": from_number,
                     "to_number": to_number,
                     "call_sid": call_sid,
+                    "provider_call_id": call_sid,
+                    "provider": "twilio",
+                    "call_context": call_context,
                     "tenant_id": active_tenant_id,
                     "client_name": client_name,
                     "client_salutation": client_salutation,
@@ -921,61 +946,95 @@ async def twilio_status_webhook(request: Request):
 
 @app.post("/api/prompt-config")
 async def prompt_config(request: Request):
-    """
-    ElevenLabs Server URL endpoint — volá sa pred každým hovorom.
-    Vracia dynamic_variables s aktuálnym menu z DB alebo neutrálne dáta pre NTC.
-    """
+    """Return provider-neutral initiation data for ElevenLabs phone calls."""
     tenant = request.query_params.get("tenant", "pizzeria")
-    
-    # Try to extract the caller phone from the request body if ElevenLabs sends it
-    caller_phone = ""
     try:
         body = await request.json()
-        print(f"[prompt-config] ElevenLabs request body: {body}")
-        
-        # Look for phone in common body structures
-        raw_from = body.get("from_number") or body.get("caller_number") or ""
-        if not raw_from and isinstance(body.get("call"), dict):
-            raw_from = body["call"].get("from_number") or body["call"].get("caller_number") or ""
-        
-        # Or look for call_sid to match against CALL_CONTEXT
-        call_sid = body.get("call_sid") or ""
-        if not raw_from and call_sid:
-            raw_from = CALL_CONTEXT.get(call_sid, "")
-            
-        caller_phone = _normalize_phone(raw_from)
-    except Exception as e:
-        print(f"[prompt-config] Failed to parse request body: {e}")
-        
-    if not caller_phone or _is_twilio_owned_number(caller_phone):
-        # Fallback to last resolved customer phone
-        caller_phone = _LAST_CALLER_PHONE
-        print(f"[prompt-config] Using _LAST_CALLER_PHONE fallback: {caller_phone}")
+        body = body if isinstance(body, dict) else {}
+    except Exception as exc:
+        print(f"[prompt-config] Failed to parse request body: {exc}")
+        body = {}
 
-    if tenant == "ntc":
-        client_name = ""
-        client_salutation = ""
+    nested_call = body.get("call") if isinstance(body.get("call"), dict) else {}
+    caller_phone = _normalize_phone(
+        body.get("caller_id")
+        or body.get("from_number")
+        or body.get("caller_number")
+        or nested_call.get("caller_id")
+        or nested_call.get("from_number")
+        or nested_call.get("caller_number")
+        or ""
+    )
+    call_sid = str(body.get("call_sid") or nested_call.get("call_sid") or "").strip()
+    sip_call_id = str(body.get("call_id") or nested_call.get("call_id") or "").strip()
+    conversation_id = str(
+        body.get("conversation_id") or nested_call.get("conversation_id") or ""
+    ).strip()
+    provider_call_id = call_sid or sip_call_id or conversation_id
+    provider = "twilio" if call_sid.startswith("CA") else "sip"
+    configured_webhook_secret = os.getenv("ELEVENLABS_INIT_WEBHOOK_SECRET", "").strip()
+    supplied_webhook_secret = request.headers.get("x-elevenlabs-webhook-secret", "").strip()
+    webhook_is_trusted = bool(
+        configured_webhook_secret
+        and supplied_webhook_secret
+        and hmac.compare_digest(configured_webhook_secret, supplied_webhook_secret)
+    )
+
+    caller_is_valid = bool(caller_phone and not _is_twilio_owned_number(caller_phone))
+    context_token = ""
+    if webhook_is_trusted and caller_is_valid and provider_call_id:
+        for context_id in {provider_call_id, call_sid, sip_call_id, conversation_id} - {""}:
+            CALL_CONTEXT[context_id] = caller_phone
+        if conversation_id:
+            CONVERSATION_CONTEXT[conversation_id] = caller_phone
+        try:
+            context_token = create_call_context(
+                caller_phone=caller_phone,
+                call_id=provider_call_id,
+                conversation_id=conversation_id,
+                provider=provider,
+            )
+        except RuntimeError as exc:
+            print(f"[prompt-config] Call context unavailable: {exc}")
+            caller_phone = ""
+    else:
         if caller_phone:
-            client_name, _ = find_user_name_and_id_by_phone(caller_phone)
-            client_name = client_name or ""
-            if client_name:
-                client_salutation = format_client_salutation(client_name)
-        
-        print(f"[prompt-config] NTC resolved: client_name='{client_name}', client_salutation='{client_salutation}' for phone '{caller_phone}'")
-        return {
-            "dynamic_variables": {
-                "menu": "U nás si môžete rezervovať kurty na tenis a bedminton.",
-                "client_name": client_name,
-                "client_salutation": client_salutation,
-            }
-        }
+            print("[prompt-config] Untrusted or invalid caller identity; not exposed")
+        caller_phone = ""
 
-    menu_text = format_menu_from_db(TENANT_ID)
-    return {
-        "dynamic_variables": {
-            "menu": menu_text if menu_text else "Menu nie je momentálne dostupné.",
-        }
+    client_name = ""
+    client_salutation = ""
+    if tenant == "ntc" and caller_phone:
+        client_name, _ = find_user_name_and_id_by_phone(caller_phone)
+        client_name = client_name or ""
+        if client_name:
+            client_salutation = format_client_salutation(client_name)
+
+    print(
+        f"[prompt-config] provider={provider}, call_id={provider_call_id}, "
+        f"conversation_id={conversation_id}, caller_resolved={bool(caller_phone)}, "
+        f"context_signed={bool(context_token)}"
+    )
+    dynamic_variables = {
+        "menu": (
+            "U nás si môžete rezervovať kurty na tenis a bedminton."
+            if tenant == "ntc"
+            else (format_menu_from_db(TENANT_ID) or "Menu nie je momentálne dostupné.")
+        ),
+        "caller_number": caller_phone,
+        "provider_call_id": provider_call_id,
+        "call_sid": call_sid or provider_call_id,
+        "conversation_id": conversation_id,
+        "provider": provider,
+        "call_context": context_token,
+        "client_name": client_name,
+        "client_salutation": client_salutation,
     }
+    return {
+        "type": "conversation_initiation_client_data",
+        "dynamic_variables": dynamic_variables,
+    }
+
 
 
 def build_address_message(found: bool, needs_confirmation: bool, best_match: str | None, match_type: str) -> str:
@@ -1470,7 +1529,7 @@ async def ntc_check_availability(req: CheckAvailabilityRequest):
 
     busy_courts = _get_ntc_busy_courts(start_dt, end_dt)
 
-        # Determine court capacity: badminton 10, tennis 8, squash 4, clay 4.
+    # Determine court capacity: badminton 10, tennis 8, squash 4, clay 4.
     limit = 10 if sport_key == "badminton" else (8 if sport_key == "tennis" else 4)
     all_sport_courts = [f"{sport_key}-{i}" for i in range(1, limit + 1)]
     free_courts = [c for c in all_sport_courts if c not in busy_courts]
@@ -1607,20 +1666,48 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
 
     req_caller = req.caller_number or ""
     dynamic_variables = req.dynamic_variables or {}
+    context_token = req.call_context or dynamic_variables.get("call_context") or ""
+    context = verify_call_context(context_token) if context_token else None
+    if context_token and not context:
+        print(f"[ntc-create-booking] REJECT 403: call_context token verification failed: '{context_token[:20]}...'")
+        raise HTTPException(status_code=403, detail="Kontext hovoru je neplatný alebo vypršal.")
+
+    legacy_call_sid = str(req.call_sid or dynamic_variables.get("call_sid") or "").strip()
+    if not context and (
+        len(legacy_call_sid) == 34
+        and legacy_call_sid.startswith("CA")
+        and all(character in "0123456789abcdefABCDEF" for character in legacy_call_sid[2:])
+    ):
+        legacy_phone = CALL_CONTEXT.get(legacy_call_sid, "")
+        if legacy_phone:
+            context = {
+                "caller_phone": legacy_phone,
+                "call_id": legacy_call_sid,
+                "conversation_id": "",
+                "provider": "twilio",
+            }
+            print(f"[ntc-create-booking] Resolved Twilio legacy context for call_sid={legacy_call_sid}, phone={legacy_phone}")
+
+    trusted_caller = _normalize_phone(context.get("caller_phone", "")) if context else ""
     dynamic_caller = dynamic_variables.get("caller_number") or dynamic_variables.get("from_number") or ""
-    caller_number = _normalize_phone(req_caller or dynamic_caller or "")
+    caller_number = _normalize_phone(trusted_caller or req_caller or dynamic_caller or "")
     payload_phone = _normalize_phone(req.customer_phone or "")
     if caller_number and not _is_twilio_owned_number(caller_number):
         real_phone = caller_number
     elif payload_phone and not _is_twilio_owned_number(payload_phone):
         real_phone = payload_phone
-    elif _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
+    elif not context and _LAST_CALLER_PHONE and not _is_twilio_owned_number(_LAST_CALLER_PHONE):
         real_phone = _LAST_CALLER_PHONE
     else:
         real_phone = ""
 
     phone_to_match = real_phone or req.customer_phone or req.caller_number or ""
     user_name, user_id = find_user_name_and_id_by_phone(phone_to_match)
+    print(
+        f"[ntc-create-booking] sport={req.sport}, court={selected_court}, "
+        f"phone_to_match='{phone_to_match}', member='{user_name}' ({user_id}), "
+        f"has_context={bool(context)}, has_token={bool(context_token)}, call_sid='{legacy_call_sid}'"
+    )
     start_at = start_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     end_at = end_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
@@ -1642,6 +1729,12 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
     balance_eur = None
 
     if user_id:
+        if not context:
+            print(f"[ntc-create-booking] REJECT 403: Member '{user_name}' ({user_id}) cannot be charged without verified call context or valid Twilio call_sid.")
+            raise HTTPException(
+                status_code=403,
+                detail="Člena sa nepodarilo bezpečne overiť v kontexte hovoru.",
+            )
         # Registrovaný člen NTC: stiahne kredit cez overenú SQL RPC funkciu
         try:
             print(f"[ntc-create-booking] Volám wallet_create_ntc_booking pre člena {user_name} ({user_id}) na kurt {selected_court}")
@@ -1654,7 +1747,15 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
                 "p_start_at": start_at,
                 "p_end_at": end_at,
                 "p_notes": json.dumps(notes_obj),
-                "p_idempotency_key": f"voice-{uuid.uuid4()}",
+                "p_idempotency_key": booking_operation_id(
+                    context,
+                    {
+                        "user_id": str(user_id),
+                        "sport": sport_key,
+                        "start_at": start_at,
+                        "end_at": end_at,
+                    },
+                ),
             }
             rpc_res = supabase.rpc("wallet_create_ntc_booking", rpc_payload).execute()
             if not rpc_res.data or len(rpc_res.data) == 0:
