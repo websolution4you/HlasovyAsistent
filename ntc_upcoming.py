@@ -12,14 +12,18 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 
 class UpcomingBookingsRequest(BaseModel):
-    call_sid: str
+    call_sid: str = ""
+    caller_number: str | None = None
+    customer_phone: str | None = None
 
 
 class CancelBookingRequest(BaseModel):
-    call_sid: str
+    call_sid: str = ""
     booking_reference: str = Field(min_length=1, max_length=128)
-    action: str
+    action: str = "prepare"
     confirmation_token: str | None = Field(default=None, max_length=2048)
+    caller_number: str | None = None
+    customer_phone: str | None = None
 
 
 _PENDING_CANCELLATION_TTL = datetime.timedelta(minutes=5)
@@ -258,6 +262,13 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
             raise HTTPException(status_code=400, detail="Neplatný kontext hovoru.")
 
         caller_phone = main_module.CALL_CONTEXT.get(call_sid)
+        if not caller_phone and getattr(main_module, "_LAST_CALLER_PHONE", None):
+            caller_phone = main_module._LAST_CALLER_PHONE
+        if not caller_phone and getattr(req, "caller_number", None):
+            caller_phone = main_module._normalize_phone(req.caller_number)
+        if not caller_phone and getattr(req, "customer_phone", None):
+            caller_phone = main_module._normalize_phone(req.customer_phone)
+
         if not caller_phone:
             raise HTTPException(
                 status_code=403,
@@ -334,6 +345,13 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
             )
 
         caller_phone = main_module.CALL_CONTEXT.get(call_sid)
+        if not caller_phone and getattr(main_module, "_LAST_CALLER_PHONE", None):
+            caller_phone = main_module._LAST_CALLER_PHONE
+        if not caller_phone and getattr(req, "caller_number", None):
+            caller_phone = main_module._normalize_phone(req.caller_number)
+        if not caller_phone and getattr(req, "customer_phone", None):
+            caller_phone = main_module._normalize_phone(req.customer_phone)
+
         if not caller_phone:
             raise HTTPException(
                 status_code=403,
@@ -362,7 +380,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
         if action == "prepare":
             try:
                 query = main_module.supabase.table("bookings").select(
-                    "id, sport, court_id, start_at, end_at, notes"
+                    "id, sport, court_id, start_at, end_at, notes, price_eur"
                 )
                 query = query.eq("id", booking_reference)
                 query = query.eq("tenant_id", main_module.NTC_TENANT_ID)
@@ -408,12 +426,36 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
                 }
             )
 
-            confirmation_message = (
-                f"{spoken_text} Naozaj chcete túto rezerváciu zrušiť?"
-            )
+            # Zistenie sumy na vrátenie (z ceny rezervácie alebo histórie transakcií)
+            booking_price = float(rows[0].get("price_eur") or 0.0)
+            if booking_price <= 0:
+                try:
+                    tx_res = (
+                        main_module.supabase.table("wallet_transactions")
+                        .select("amount_eur")
+                        .eq("booking_id", booking_reference)
+                        .eq("type", "booking_charge")
+                        .limit(1)
+                        .execute()
+                    )
+                    if tx_res.data:
+                        booking_price = abs(float(tx_res.data[0].get("amount_eur") or 0.0))
+                except Exception:
+                    pass
+
+            if booking_price > 0:
+                confirmation_message = (
+                    f"{spoken_text} Po zrušení vám bude vrátený kredit vo výške {booking_price:.2f} € späť do peňaženky. "
+                    f"Naozaj chcete túto rezerváciu zrušiť?"
+                )
+            else:
+                confirmation_message = (
+                    f"{spoken_text} Naozaj chcete túto rezerváciu zrušiť?"
+                )
+
             print(
                 f"[ntc-cancel] Prepared call_sid={call_sid}, "
-                f"customer='{customer_name or ''}', booking={booking_reference}"
+                f"customer='{customer_name or ''}', booking={booking_reference}, refund_est={booking_price}"
             )
             return {
                 "status": "awaiting_confirmation",
@@ -422,6 +464,7 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
                 "confirmation_token": confirmation_token,
                 "message": confirmation_message,
                 "booking": booking,
+                "refund_amount_eur": booking_price,
             }
 
         token_payload = _decode_confirmation_token(confirmation_token)
@@ -444,40 +487,100 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
                 ),
             }
 
+        # 1. Overenie, že rezervácia existuje, patrí používateľovi a je stále potvrdená
         try:
-            query = main_module.supabase.table("bookings").update(
-                {"status": "cancelled"}
+            check_query = (
+                main_module.supabase.table("bookings")
+                .select("id, status, start_at")
+                .eq("id", booking_reference)
+                .eq("tenant_id", main_module.NTC_TENANT_ID)
+                .eq("user_id", user_id)
+                .eq("status", "confirmed")
+                .gte("start_at", now_iso)
+                .limit(1)
+                .execute()
             )
-            query = query.eq("id", booking_reference)
-            query = query.eq("tenant_id", main_module.NTC_TENANT_ID)
-            query = query.eq("user_id", user_id)
-            query = query.eq("status", "confirmed")
-            result = query.gte("start_at", now_iso).execute()
+            if not (check_query.data or []):
+                return {
+                    "status": "not_cancellable",
+                    "cancelled": False,
+                    "message": (
+                        "Rezervácia už bola zrušená alebo ju už nie je možné zrušiť."
+                    ),
+                }
         except Exception as exc:
             print(
-                f"[ntc-cancel] Confirm update failed for verified "
-                f"call_sid={call_sid}: {exc}"
+                f"[ntc-cancel] Confirm check failed for verified call_sid={call_sid}: {exc}"
             )
             raise HTTPException(
                 status_code=503,
-                detail="Rezerváciu momentálne nie je možné zrušiť.",
+                detail="Rezerváciu momentálne nie je možné overiť.",
             ) from exc
 
-        if not (result.data or []):
-            return {
-                "status": "not_cancellable",
-                "cancelled": False,
-                "message": (
-                    "Rezervácia už bola zrušená alebo ju už nie je možné zrušiť."
-                ),
-            }
+        # 2. Bezpečné zrušenie a vrátenie kreditu cez Supabase RPC wallet_refund_ntc_booking
+        refunded = False
+        refunded_eur = 0.0
+        balance_eur = None
+
+        try:
+            print(
+                f"[ntc-cancel] Volám wallet_refund_ntc_booking pre člena {customer_name} ({user_id}), "
+                f"booking={booking_reference}"
+            )
+            rpc_res = main_module.supabase.rpc(
+                "wallet_refund_ntc_booking",
+                {"p_booking_id": booking_reference},
+            ).execute()
+
+            if rpc_res.data and len(rpc_res.data) > 0:
+                result_row = rpc_res.data[0]
+                refunded = bool(result_row.get("refunded", False))
+                refunded_eur = float(result_row.get("refunded_eur") or 0.0)
+                balance_eur = float(result_row.get("balance_eur") or 0.0)
+                print(
+                    f"[ntc-cancel] Peňaženka úspešne spracovaná cez RPC: "
+                    f"vrátené {refunded_eur} €, nový zostatok {balance_eur} €, refunded={refunded}"
+                )
+            else:
+                # Fallback ak by RPC nič nevrátilo - zrušíme rezerváciu priamo
+                print("[ntc-cancel] RPC nevrátilo riadky, označujem rezerváciu ako cancelled priamo")
+                main_module.supabase.table("bookings").update(
+                    {"status": "cancelled"}
+                ).eq("id", booking_reference).execute()
+
+        except Exception as exc:
+            print(f"[ntc-cancel] wallet_refund_ntc_booking RPC zlyhalo: {exc}")
+            # Núdzový update rezervácie
+            try:
+                main_module.supabase.table("bookings").update(
+                    {"status": "cancelled"}
+                ).eq("id", booking_reference).execute()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail="Chyba pri spracovaní zrušenia rezervácie a vrátení kreditu.",
+            ) from exc
+
+        if refunded and refunded_eur > 0:
+            message = (
+                f"Rezervácia bola úspešne zrušená a suma {refunded_eur:.2f} € vám bola vrátená do peňaženky."
+            )
+            if balance_eur is not None:
+                message += f" Váš aktuálny kredit je {balance_eur:.2f} €."
+        else:
+            message = "Rezervácia bola úspešne zrušená."
 
         print(
             f"[ntc-cancel] Cancelled call_sid={call_sid}, "
-            f"customer='{customer_name or ''}', booking={booking_reference}"
+            f"customer='{customer_name or ''}', booking={booking_reference}, "
+            f"refunded={refunded}, refunded_eur={refunded_eur}, balance_eur={balance_eur}"
         )
         return {
             "status": "cancelled",
             "cancelled": True,
-            "message": "Rezervácia bola úspešne zrušená.",
+            "refunded": refunded,
+            "refunded_eur": refunded_eur,
+            "balance_eur": balance_eur,
+            "message": message,
         }
