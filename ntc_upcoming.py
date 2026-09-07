@@ -291,6 +291,25 @@ class CallContextCleanupMiddleware(BaseHTTPMiddleware):
         return response
 
 
+def _get_cancellation_deadline_hours(main_module) -> int:
+    """Vráti minimálnu lehotu na zrušenie rezervácie v hodinách (default: 24h)."""
+    try:
+        policy_res = (
+            main_module.supabase.table("booking_policies")
+            .select("cancellation_deadline_hours")
+            .eq("tenant_id", main_module.NTC_TENANT_ID)
+            .limit(1)
+            .execute()
+        )
+        if policy_res.data and len(policy_res.data) > 0:
+            val = policy_res.data[0].get("cancellation_deadline_hours")
+            if val is not None:
+                return int(val)
+    except Exception:
+        pass
+    return 24
+
+
 def register_ntc_upcoming_tool(app, main_module) -> None:
     app.add_middleware(CallContextCleanupMiddleware, main_module=main_module)
 
@@ -423,6 +442,23 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
                     ),
                 }
 
+            # Kontrola lehoty na zrušenie (minimálne 24 hodín pred začiatkom)
+            start_utc = main_module._parse_iso_to_utc(str(rows[0].get("start_at") or ""))
+            deadline_hours = _get_cancellation_deadline_hours(main_module)
+            if start_utc <= now_utc + datetime.timedelta(hours=deadline_hours):
+                print(
+                    f"[ntc-cancel] REJECT prepare: Booking {booking_reference} starts at {start_utc.isoformat()}, "
+                    f"which is less than {deadline_hours} hours from now ({now_utc.isoformat()})."
+                )
+                return {
+                    "status": "not_cancellable",
+                    "cancelled": False,
+                    "message": (
+                        f"Rezerváciu je možné zrušiť najneskôr {deadline_hours} hodín pred jej začiatkom. "
+                        "Túto rezerváciu už nie je možné zrušiť cez hlasového asistenta, obráťte sa, prosím, na recepciu."
+                    ),
+                }
+
             formatted = _format_booking(rows[0], main_module._parse_iso_to_utc)
             if not formatted:
                 return {
@@ -502,7 +538,7 @@ f"[ntc-cancel] Prepared call_id={call_id}, "
                 ),
             }
 
-        # 1. Overenie, že rezervácia existuje, patrí používateľovi a je stále potvrdená
+        # 1. Overenie, že rezervácia existuje, patrí používateľovi, je potvrdená a je viac ako 24h pred začiatkom
         try:
             check_query = (
                 main_module.supabase.table("bookings")
@@ -515,12 +551,28 @@ f"[ntc-cancel] Prepared call_id={call_id}, "
                 .limit(1)
                 .execute()
             )
-            if not (check_query.data or []):
+            rows = check_query.data or []
+            if not rows:
                 return {
                     "status": "not_cancellable",
                     "cancelled": False,
                     "message": (
                         "Rezervácia už bola zrušená alebo ju už nie je možné zrušiť."
+                    ),
+                }
+
+            start_utc = main_module._parse_iso_to_utc(str(rows[0].get("start_at") or ""))
+            deadline_hours = _get_cancellation_deadline_hours(main_module)
+            if start_utc <= now_utc + datetime.timedelta(hours=deadline_hours):
+                print(
+                    f"[ntc-cancel] REJECT confirm: Booking {booking_reference} starts within {deadline_hours} hours: {start_utc.isoformat()}."
+                )
+                return {
+                    "status": "not_cancellable",
+                    "cancelled": False,
+                    "message": (
+                        f"Rezerváciu je možné zrušiť najneskôr {deadline_hours} hodín pred jej začiatkom. "
+                        "Obráťte sa, prosím, na recepciu."
                     ),
                 }
         except Exception as exc:

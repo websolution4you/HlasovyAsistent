@@ -214,6 +214,45 @@ class ProviderNeutralBookingToolsTests(unittest.TestCase):
             )
         )
 
+    def test_cancellation_within_24h_is_rejected(self):
+        near_future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=5)
+        near_booking = {
+            "id": "booking-near-1",
+            "tenant_id": "tenant-ntc",
+            "user_id": "user-1",
+            "status": "confirmed",
+            "sport": "tennis",
+            "court_id": "tennis-1",
+            "start_at": near_future.isoformat(),
+            "end_at": (near_future + datetime.timedelta(hours=1)).isoformat(),
+            "notes": {},
+        }
+        database = FakeSupabase([near_booking])
+        main_mod = SimpleNamespace(
+            CALL_CONTEXT={},
+            CONVERSATION_CONTEXT={},
+            supabase=database,
+            NTC_TENANT_ID="tenant-ntc",
+            find_user_name_and_id_by_phone=lambda phone: ("Ján Novák", "user-1"),
+            _parse_iso_to_utc=self.parse_iso_to_utc,
+        )
+        app = FastAPI()
+        register_ntc_upcoming_tool(app, main_mod)
+        cancel_endpoint = next(route.endpoint for route in app.routes if route.path == "/api/ntc-cancel-booking")
+
+        prepared = asyncio.run(
+            cancel_endpoint(
+                CancelBookingRequest(
+                    call_context=self.call_context,
+                    booking_reference="booking-near-1",
+                    action="prepare",
+                )
+            )
+        )
+        self.assertEqual(prepared["status"], "not_cancellable")
+        self.assertFalse(prepared["cancelled"])
+        self.assertIn("24 hodín", prepared["message"])
+
     def test_signed_telnyx_context_creates_member_booking_with_idempotent_retries(self):
         req = main.CreateBookingRequest(
             sport="tennis",
