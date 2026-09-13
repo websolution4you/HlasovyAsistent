@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import datetime
 import hashlib
@@ -309,6 +310,32 @@ def _get_cancellation_deadline_hours(main_module) -> int:
     except Exception:
         pass
     return 24
+
+
+def _mirror_cancel_to_supabase(main_module, booking_reference: str, refunded: bool):
+    """Zrkadlenie storna rezervácie a vrátenia kreditu do Supabase."""
+    if not getattr(main_module, "supabase", None):
+        return
+    try:
+        if refunded:
+            main_module.supabase.rpc(
+                "wallet_refund_ntc_booking",
+                {"p_booking_id": booking_reference},
+            ).execute()
+            print(f"[mirror-supabase] Storno s refundáciou rezervácie {booking_reference} zrkadlené do Supabase.")
+        else:
+            main_module.supabase.table("bookings").update(
+                {"status": "cancelled"}
+            ).eq("id", booking_reference).execute()
+            print(f"[mirror-supabase] Storno rezervácie {booking_reference} zrkadlené do Supabase.")
+    except Exception as exc:
+        print(f"[mirror-supabase] Chyba pri zrkadlení storna do Supabase: {exc}")
+        try:
+            main_module.supabase.table("bookings").update(
+                {"status": "cancelled"}
+            ).eq("id", booking_reference).execute()
+        except Exception:
+            pass
 
 
 def register_ntc_upcoming_tool(app, main_module) -> None:
@@ -722,9 +749,11 @@ def register_ntc_upcoming_tool(app, main_module) -> None:
                         f"[ntc-cancel] Peňaženka úspešne spracovaná cez Cloud SQL: "
                         f"vrátené {refunded_eur} €, nový zostatok {balance_eur} €, refunded={refunded}"
                     )
+                    asyncio.create_task(asyncio.to_thread(_mirror_cancel_to_supabase, main_module, booking_reference, refunded))
                 else:
                     print("[ntc-cancel] Funkcia nevrátila riadok, označujem rezerváciu ako cancelled")
                     await main_module.db_execute("UPDATE public.bookings SET status = 'cancelled' WHERE id = $1::uuid;", booking_reference)
+                    asyncio.create_task(asyncio.to_thread(_mirror_cancel_to_supabase, main_module, booking_reference, False))
             elif getattr(main_module, "supabase", None):
                 rpc_res = main_module.supabase.rpc(
                     "wallet_refund_ntc_booking",

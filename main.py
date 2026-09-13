@@ -1720,6 +1720,44 @@ async def perform_ntc_booking_async(
         print(f"[ntc-booking-async] Chyba pri zápise rezervácie/notifikácii: {e}")
 
 
+def mirror_booking_to_supabase(booking_data: dict):
+    """Zrkadlenie bežnej rezervácie do Supabase ako záloha."""
+    if not supabase:
+        return
+    try:
+        supabase.table("bookings").upsert(booking_data).execute()
+        print(f"[mirror-supabase] Rezervácia {booking_data.get('id')} úspešne zrkadlená do Supabase.")
+    except Exception as exc:
+        print(f"[mirror-supabase] Chyba pri zrkadlení rezervácie do Supabase: {exc}")
+
+
+def mirror_wallet_booking_to_supabase(rpc_payload: dict, booking_id: str):
+    """Zrkadlenie členskej rezervácie a stiahnutia kreditu do Supabase."""
+    if not supabase:
+        return
+    try:
+        supabase.rpc("wallet_create_ntc_booking", rpc_payload).execute()
+        print(f"[mirror-supabase] Peňaženková rezervácia pre {rpc_payload.get('p_customer_name')} úspešne zrkadlená do Supabase.")
+    except Exception as exc:
+        print(f"[mirror-supabase] wallet_create_ntc_booking v Supabase zlyhalo: {exc}, skúšam priamy insert do bookings...")
+        try:
+            supabase.table("bookings").upsert({
+                "id": booking_id,
+                "tenant_id": NTC_TENANT_ID,
+                "court_id": rpc_payload.get("p_court_id"),
+                "sport": rpc_payload.get("p_sport"),
+                "customer_name": rpc_payload.get("p_customer_name"),
+                "customer_phone": rpc_payload.get("p_customer_phone"),
+                "start_at": rpc_payload.get("p_start_at"),
+                "end_at": rpc_payload.get("p_end_at"),
+                "status": "confirmed",
+                "notes": rpc_payload.get("p_notes"),
+            }).execute()
+            print(f"[mirror-supabase] Priamy zápis rezervácie {booking_id} do Supabase úspešný.")
+        except Exception as e2:
+            print(f"[mirror-supabase] Priamy zápis rezervácie do Supabase zlyhal: {e2}")
+
+
 @app.post("/api/ntc-create-booking")
 async def ntc_create_booking(req: CreateBookingRequest, background_tasks: BackgroundTasks):
     """Create an NTC booking in Supabase on the first suitable free court."""
@@ -1851,6 +1889,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
                     booking_id = str(row["booking_id"])
                     charged_eur = float(row["charged_eur"] or 0.0)
                     balance_eur = float(row["balance_eur"] or 0.0)
+                    background_tasks.add_task(mirror_wallet_booking_to_supabase, rpc_payload, booking_id)
                 except Exception as db_exc:
                     if "nedostatok kreditu" in str(db_exc).lower() or "obsadený" in str(db_exc).lower():
                         raise
@@ -1913,6 +1952,8 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
             if not row:
                 raise HTTPException(status_code=500, detail="Rezerváciu sa nepodarilo zapísať.")
             booking_id = str(row["id"])
+            booking_data["id"] = booking_id
+            background_tasks.add_task(mirror_booking_to_supabase, booking_data)
         elif supabase:
             db_result = supabase.table("bookings").insert(booking_data).execute()
             if not db_result.data:
