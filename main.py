@@ -230,7 +230,19 @@ async def find_user_name_and_id_by_phone(phone: str) -> Tuple[Optional[str], Opt
                     if user_phone:
                         user_digits = "".join(c for c in user_phone if c.isdigit())
                         if len(user_digits) >= 9 and user_digits[-9:] == input_last_9:
-                            return user.get("name"), user.get("id")
+                            u_name = user.get("name")
+                            u_id = user.get("id")
+                            if pool:
+                                try:
+                                    await db_execute("""
+                                        INSERT INTO public.booking_users (id, name, phone)
+                                        VALUES ($1::uuid, $2, $3)
+                                        ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, phone = EXCLUDED.phone;
+                                    """, u_id, u_name, user_phone)
+                                    print(f"[find-user] Používateľ {u_name} ({u_id}) automaticky zosynchronizovaný zo Supabase do Cloud SQL.")
+                                except Exception as sync_err:
+                                    print(f"[find-user] Auto-sync používateľa do Cloud SQL zlyhal: {sync_err}")
+                            return u_name, u_id
         except Exception as e:
             print(f"[find-user] Failed to query booking_users via Supabase: {e}")
     return None, None
