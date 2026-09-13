@@ -22,9 +22,9 @@ async def init_db_pool() -> Optional[asyncpg.Pool]:
         return _pool
 
     database_url = os.getenv("DATABASE_URL", "").strip()
-    db_user = os.getenv("DB_USER", "telio_app").strip()
-    db_password = os.getenv("DB_PASSWORD", "").strip()
-    db_name = os.getenv("DB_NAME", "telio").strip()
+    db_user = os.getenv("DB_USER", os.getenv("DATABASE_USER", "telio_app")).strip()
+    db_password = (os.getenv("DB_PASSWORD") or os.getenv("DATABASE_PASSWORD", "")).strip()
+    db_name = os.getenv("DB_NAME", os.getenv("DATABASE_NAME", "telio")).strip()
     db_host = os.getenv("DB_HOST", "").strip()
     db_port = int(os.getenv("DB_PORT", "5432"))
 
