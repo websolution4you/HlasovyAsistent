@@ -1512,14 +1512,25 @@ async def _get_ntc_busy_courts(start_dt: datetime.datetime, end_dt: datetime.dat
     if pool:
         try:
             rows = await db_fetch("""
-                SELECT DISTINCT lower(trim(coalesce(court_id, notes->>'courtId'))) as court_id
+                SELECT court_id, notes
                   FROM public.bookings
                  WHERE tenant_id = $1::uuid
                    AND status <> 'cancelled'
                    AND start_at < $3
                    AND end_at > $2;
             """, NTC_TENANT_ID, start_utc, end_utc)
-            return {r["court_id"] for r in rows if r["court_id"]}
+            busy_courts = set()
+            for r in rows:
+                c_id = r.get("court_id")
+                notes = r.get("notes")
+                if not c_id and isinstance(notes, str):
+                    try:
+                        c_id = json.loads(notes).get("courtId")
+                    except Exception:
+                        c_id = None
+                if c_id:
+                    busy_courts.add(str(c_id).lower().strip())
+            return busy_courts
         except Exception as exc:
             print(f"[busy-courts] Cloud SQL query failed: {exc}")
             raise HTTPException(
