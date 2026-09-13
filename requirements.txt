@@ -6,11 +6,13 @@ python-dotenv
 python-multipart
 rapidfuzz
 httpx
+openai
 elevenlabs
 requests
 twilio
 websockets
 tzdata
+asyncpg
 
 
 

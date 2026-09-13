@@ -14,6 +14,15 @@ from pydantic import BaseModel
 from typing import Optional, Tuple
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from database import (
+    init_db_pool,
+    close_db_pool,
+    get_pool,
+    db_fetch,
+    db_fetchrow,
+    db_fetchval,
+    db_execute,
+)
 
 from call_context import booking_operation_id, create_call_context, verify_call_context
 
@@ -27,6 +36,16 @@ ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "").strip()
 ELEVENLABS_AGENT_ID_PIZZA = os.getenv("ELEVENLABS_AGENT_ID_PIZZA", "").strip()
 
 app = FastAPI(title="ElevenLabs Pizza Webhook")
+
+
+@app.on_event("startup")
+async def startup_db_pool():
+    await init_db_pool()
+
+
+@app.on_event("shutdown")
+async def shutdown_db_pool():
+    await close_db_pool()
 
 
 def _parse_cors_origins() -> list[str]:
@@ -178,8 +197,8 @@ def _normalize_phone(phone: str) -> str:
     return str(phone or "").strip().replace(" ", "")
 
 
-def find_user_name_and_id_by_phone(phone: str) -> Tuple[Optional[str], Optional[str]]:
-    if not phone or not supabase:
+async def find_user_name_and_id_by_phone(phone: str) -> Tuple[Optional[str], Optional[str]]:
+    if not phone:
         return None, None
     
     # Extract last 9 digits of input phone
@@ -188,23 +207,37 @@ def find_user_name_and_id_by_phone(phone: str) -> Tuple[Optional[str], Optional[
         return None, None
     input_last_9 = digits_only[-9:]
     
-    try:
-        # Fetch all booking users (id, phone, and name)
-        res = supabase.table("booking_users").select("id, phone, name").execute()
-        if res.data:
-            for user in res.data:
-                user_phone = user.get("phone")
-                if user_phone:
-                    user_digits = "".join(c for c in user_phone if c.isdigit())
-                    if len(user_digits) >= 9 and user_digits[-9:] == input_last_9:
-                        return user.get("name"), user.get("id")
-    except Exception as e:
-        print(f"[find-user] Failed to query booking_users: {e}")
+    # 1. Prioritne Google Cloud SQL cez priamy indexovany dotaz
+    pool = get_pool()
+    if pool:
+        try:
+            row = await db_fetchrow(
+                "SELECT id, name, phone FROM public.booking_users WHERE right(regexp_replace(phone, '\\D', '', 'g'), 9) = $1 LIMIT 1;",
+                input_last_9,
+            )
+            if row:
+                return row["name"], str(row["id"])
+        except Exception as e:
+            print(f"[find-user] Cloud SQL query failed: {e}")
+
+    # 2. Fallback na Supabase ak je nakonfigurovany
+    if supabase:
+        try:
+            res = supabase.table("booking_users").select("id, phone, name").execute()
+            if res.data:
+                for user in res.data:
+                    user_phone = user.get("phone")
+                    if user_phone:
+                        user_digits = "".join(c for c in user_phone if c.isdigit())
+                        if len(user_digits) >= 9 and user_digits[-9:] == input_last_9:
+                            return user.get("name"), user.get("id")
+        except Exception as e:
+            print(f"[find-user] Failed to query booking_users via Supabase: {e}")
     return None, None
 
 
-def find_user_id_by_phone(phone: str) -> Optional[str]:
-    _, user_id = find_user_name_and_id_by_phone(phone)
+async def find_user_id_by_phone(phone: str) -> Optional[str]:
+    _, user_id = await find_user_name_and_id_by_phone(phone)
     return user_id
 
 
@@ -504,7 +537,7 @@ def _get_streets_cached(tenant_id: str) -> list[str]:
         return _STREETS_CACHE["data"]
 
     if not supabase:
-        raise Exception("Supabase klient nie je inicializovany")
+        return []
 
     streets = []
     start = 0
@@ -578,21 +611,30 @@ async def _check_systems() -> tuple[bool, str]:
     Skontroluje ci su vsetky systemy dostupne pred spustenim hovoru.
     Vracia (ok: bool, reason: str).
     """
-    print("[check_systems] Kontrola systemov...")
+    pool = get_pool()
+    print(f"[check_systems] Cloud SQL pool ready: {pool is not None}")
     print(f"[check_systems] supabase ready: {supabase is not None}")
     print(f"[check_systems] ELEVENLABS_API_KEY nastaveny: {bool(ELEVENLABS_API_KEY)}")
     print(f"[check_systems] ELEVENLABS_AGENT_ID nastaveny: {bool(ELEVENLABS_AGENT_ID)}")
     print(f"[check_systems] ELEVENLABS_AGENT_ID_PIZZA nastaveny: {bool(ELEVENLABS_AGENT_ID_PIZZA)}")
 
-    if not supabase:
-        print("[check_systems] FAIL: Supabase klient nie je inicializovany")
-        return False, "Supabase klient nie je inicializovany"
-    try:
-        supabase.table("menu_items").select("name").limit(1).execute()
-        print("[check_systems] DB: OK")
-    except Exception as e:
-        print(f"[check_systems] FAIL: Databaza nedostupna: {e}")
-        return False, f"Databaza nedostupna: {e}"
+    if pool:
+        try:
+            await db_fetchval("SELECT 1;")
+            print("[check_systems] Cloud SQL DB: OK")
+        except Exception as e:
+            print(f"[check_systems] FAIL: Cloud SQL DB nedostupna: {e}")
+            return False, f"Databaza Cloud SQL nedostupna: {e}"
+    elif supabase:
+        try:
+            supabase.table("bookings").select("id").limit(1).execute()
+            print("[check_systems] Supabase DB: OK")
+        except Exception as e:
+            print(f"[check_systems] FAIL: Supabase DB nedostupna: {e}")
+            return False, f"Databaza nedostupna: {e}"
+    else:
+        print("[check_systems] FAIL: Databaza nie je inicializovana")
+        return False, "Databaza nie je inicializovana"
     if not ELEVENLABS_API_KEY:
         print("[check_systems] FAIL: ELEVENLABS_API_KEY chyba")
         return False, "Chyba ELEVENLABS_API_KEY"
@@ -692,6 +734,7 @@ def health_config():
             "supabase_key_present": bool(SUPABASE_KEY),
             "tenant_id_present": bool(TENANT_ID),
             "supabase_client_ready": supabase is not None,
+            "database_pool_ready": get_pool() is not None,
             "cors_allow_origins": CORS_ALLOW_ORIGINS,
         },
     }
@@ -848,7 +891,7 @@ async def twilio_voice_webhook(request: Request):
         client_name = ""
         client_salutation = ""
         if is_ntc and customer_number:
-            client_name, _ = find_user_name_and_id_by_phone(customer_number)
+            client_name, _ = await find_user_name_and_id_by_phone(customer_number)
             client_name = client_name or ""
             if client_name:
                 client_salutation = format_client_salutation(client_name)
@@ -1005,7 +1048,7 @@ async def prompt_config(request: Request):
     client_name = ""
     client_salutation = ""
     if tenant == "ntc" and caller_phone:
-        client_name, _ = find_user_name_and_id_by_phone(caller_phone)
+        client_name, _ = await find_user_name_and_id_by_phone(caller_phone)
         client_name = client_name or ""
         if client_name:
             client_salutation = format_client_salutation(client_name)
@@ -1459,10 +1502,35 @@ def _parse_elevenlabs_to_utc(iso_str: str) -> datetime.datetime:
     return dt.astimezone(datetime.timezone.utc)
 
 
-def _get_ntc_busy_courts(start_dt: datetime.datetime, end_dt: datetime.datetime) -> set:
+async def _get_ntc_busy_courts(start_dt: datetime.datetime, end_dt: datetime.datetime) -> set:
     """Return court IDs with active bookings overlapping the requested UTC interval."""
     start_utc = start_dt.astimezone(datetime.timezone.utc)
     end_utc = end_dt.astimezone(datetime.timezone.utc)
+
+    # 1. Prioritne Google Cloud SQL
+    pool = get_pool()
+    if pool:
+        try:
+            rows = await db_fetch("""
+                SELECT DISTINCT lower(trim(coalesce(court_id, notes->>'courtId'))) as court_id
+                  FROM public.bookings
+                 WHERE tenant_id = $1::uuid
+                   AND status <> 'cancelled'
+                   AND start_at < $3
+                   AND end_at > $2;
+            """, NTC_TENANT_ID, start_utc, end_utc)
+            return {r["court_id"] for r in rows if r["court_id"]}
+        except Exception as exc:
+            print(f"[busy-courts] Cloud SQL query failed: {exc}")
+            raise HTTPException(
+                status_code=503,
+                detail="Dostupnosť kurtov sa momentálne nedá bezpečne overiť.",
+            ) from exc
+
+    # 2. Fallback na Supabase ak je dostupny
+    if not supabase:
+        return set()
+
     try:
         result = (
             supabase.table("bookings")
@@ -1527,7 +1595,7 @@ async def ntc_check_availability(req: CheckAvailabilityRequest):
 
     print(f"[ntc-check] Checking availability for {sport_key} from {start_dt.isoformat()} to {end_dt.isoformat()}")
 
-    busy_courts = _get_ntc_busy_courts(start_dt, end_dt)
+    busy_courts = await _get_ntc_busy_courts(start_dt, end_dt)
 
     # Determine court capacity: badminton 10, tennis 8, squash 4, clay 4.
     limit = 10 if sport_key == "badminton" else (8 if sport_key == "tennis" else 4)
@@ -1656,7 +1724,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
     limit = 10 if sport_key == "badminton" else (8 if sport_key == "tennis" else 4)
     all_sport_courts = [f"{sport_key}-{index}" for index in range(1, limit + 1)]
 
-    busy_courts = _get_ntc_busy_courts(start_dt, end_dt)
+    busy_courts = await _get_ntc_busy_courts(start_dt, end_dt)
     free_courts = [court for court in all_sport_courts if court not in busy_courts]
     if not free_courts:
         raise HTTPException(status_code=409, detail=f"Všetky kurty pre {req.sport} v tomto čase sú plne obsadené.")
@@ -1702,7 +1770,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
         real_phone = ""
 
     phone_to_match = real_phone or req.customer_phone or req.caller_number or ""
-    user_name, user_id = find_user_name_and_id_by_phone(phone_to_match)
+    user_name, user_id = await find_user_name_and_id_by_phone(phone_to_match)
     print(
         f"[ntc-create-booking] sport={req.sport}, court={selected_court}, "
         f"phone_to_match='{phone_to_match}', member='{user_name}' ({user_id}), "
@@ -1717,7 +1785,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
         "notes": req.notes or "Rezervácia cez hlasového asistenta",
     }
 
-    latest_busy = _get_ntc_busy_courts(start_dt, end_dt)
+    latest_busy = await _get_ntc_busy_courts(start_dt, end_dt)
     if selected_court in latest_busy:
         latest_free = [court for court in all_sport_courts if court not in latest_busy]
         if not latest_free:
@@ -1739,7 +1807,7 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
         try:
             print(f"[ntc-create-booking] Volám wallet_create_ntc_booking pre člena {user_name} ({user_id}) na kurt {selected_court}")
             rpc_payload = {
-                "p_user_id": user_id,
+                "p_user_id": str(user_id),
                 "p_court_id": selected_court,
                 "p_sport": sport_key,
                 "p_customer_name": req.customer_name or user_name or "Člen NTC",
@@ -1757,14 +1825,32 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
                     },
                 ),
             }
-            rpc_res = supabase.rpc("wallet_create_ntc_booking", rpc_payload).execute()
-            if not rpc_res.data or len(rpc_res.data) == 0:
-                raise Exception("Funkcia wallet_create_ntc_booking nevrátila žiadne dáta.")
+            if get_pool():
+                row = await db_fetchrow("""
+                    SELECT booking_id, charged_eur, balance_eur, created
+                      FROM public.wallet_create_ntc_booking(
+                          $1::uuid, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8, $9
+                      );
+                """, rpc_payload["p_user_id"], rpc_payload["p_court_id"], rpc_payload["p_sport"],
+                     rpc_payload["p_customer_name"], rpc_payload["p_customer_phone"],
+                     rpc_payload["p_start_at"], rpc_payload["p_end_at"],
+                     rpc_payload["p_notes"], rpc_payload["p_idempotency_key"])
+                if not row:
+                    raise Exception("Funkcia wallet_create_ntc_booking nevrátila žiadne dáta.")
+                booking_id = str(row["booking_id"])
+                charged_eur = float(row["charged_eur"] or 0.0)
+                balance_eur = float(row["balance_eur"] or 0.0)
+            elif supabase:
+                rpc_res = supabase.rpc("wallet_create_ntc_booking", rpc_payload).execute()
+                if not rpc_res.data or len(rpc_res.data) == 0:
+                    raise Exception("Funkcia wallet_create_ntc_booking nevrátila žiadne dáta.")
+                result_row = rpc_res.data[0]
+                booking_id = result_row.get("booking_id")
+                charged_eur = float(result_row.get("charged_eur") or 0.0)
+                balance_eur = float(result_row.get("balance_eur") or 0.0)
+            else:
+                raise HTTPException(status_code=503, detail="Databáza nie je dostupná.")
 
-            result_row = rpc_res.data[0]
-            booking_id = result_row.get("booking_id")
-            charged_eur = float(result_row.get("charged_eur") or 0.0)
-            balance_eur = float(result_row.get("balance_eur") or 0.0)
             print(f"[ntc-create-booking] Peňaženka člena úspešne spracovaná: stiahnuté {charged_eur} €, zostatok {balance_eur} €")
         except Exception as exc:
             err_str = str(exc).lower()
@@ -1791,10 +1877,24 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
             "status": "confirmed",
             "notes": json.dumps(notes_obj),
         }
-        db_result = supabase.table("bookings").insert(booking_data).execute()
-        if not db_result.data:
-            raise HTTPException(status_code=500, detail="Rezerváciu sa nepodarilo zapísať.")
-        booking_id = db_result.data[0].get("id")
+        if get_pool():
+            row = await db_fetchrow("""
+                INSERT INTO public.bookings (
+                    tenant_id, court_id, sport, customer_name, customer_phone, start_at, end_at, status, notes
+                ) VALUES (
+                    $1::uuid, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8, $9
+                ) RETURNING id;
+            """, NTC_TENANT_ID, selected_court, sport_key, req.customer_name, phone_to_match, start_dt, end_dt, "confirmed", json.dumps(notes_obj))
+            if not row:
+                raise HTTPException(status_code=500, detail="Rezerváciu sa nepodarilo zapísať.")
+            booking_id = str(row["id"])
+        elif supabase:
+            db_result = supabase.table("bookings").insert(booking_data).execute()
+            if not db_result.data:
+                raise HTTPException(status_code=500, detail="Rezerváciu sa nepodarilo zapísať.")
+            booking_id = db_result.data[0].get("id")
+        else:
+            raise HTTPException(status_code=503, detail="Databáza nie je dostupná.")
 
     if real_phone:
         background_tasks.add_task(
