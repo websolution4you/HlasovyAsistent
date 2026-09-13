@@ -50,6 +50,7 @@ async def init_db_pool() -> Optional[asyncpg.Pool]:
                 min_size=1,
                 max_size=10,
                 command_timeout=30,
+                statement_cache_size=0,
             )
         elif db_host:
             print(f"[db] Connecting via TCP to {db_host}:{db_port} (db={db_name}, user={db_user})...")
@@ -67,6 +68,7 @@ async def init_db_pool() -> Optional[asyncpg.Pool]:
                 min_size=1,
                 max_size=5,
                 command_timeout=30,
+                statement_cache_size=0,
             )
         else:
             print("[db] Warning: No database connection parameters configured (DATABASE_URL, DB_HOST, or Cloud SQL socket).")

@@ -1836,20 +1836,35 @@ async def ntc_create_booking(req: CreateBookingRequest, background_tasks: Backgr
                 ),
             }
             if get_pool():
-                row = await db_fetchrow("""
-                    SELECT booking_id, charged_eur, balance_eur, created
-                      FROM public.wallet_create_ntc_booking(
-                          $1::uuid, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8, $9
-                      );
-                """, rpc_payload["p_user_id"], rpc_payload["p_court_id"], rpc_payload["p_sport"],
-                     rpc_payload["p_customer_name"], rpc_payload["p_customer_phone"],
-                     rpc_payload["p_start_at"], rpc_payload["p_end_at"],
-                     rpc_payload["p_notes"], rpc_payload["p_idempotency_key"])
-                if not row:
-                    raise Exception("Funkcia wallet_create_ntc_booking nevrátila žiadne dáta.")
-                booking_id = str(row["booking_id"])
-                charged_eur = float(row["charged_eur"] or 0.0)
-                balance_eur = float(row["balance_eur"] or 0.0)
+                try:
+                    row = await db_fetchrow("""
+                        SELECT booking_id, charged_eur, balance_eur, created
+                          FROM public.wallet_create_ntc_booking(
+                              $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9
+                          );
+                    """, rpc_payload["p_user_id"], rpc_payload["p_court_id"], rpc_payload["p_sport"],
+                         rpc_payload["p_customer_name"], rpc_payload["p_customer_phone"],
+                         start_dt, end_dt,
+                         rpc_payload["p_notes"], rpc_payload["p_idempotency_key"])
+                    if not row:
+                        raise Exception("Funkcia wallet_create_ntc_booking nevrátila žiadne dáta.")
+                    booking_id = str(row["booking_id"])
+                    charged_eur = float(row["charged_eur"] or 0.0)
+                    balance_eur = float(row["balance_eur"] or 0.0)
+                except Exception as db_exc:
+                    if "nedostatok kreditu" in str(db_exc).lower() or "obsadený" in str(db_exc).lower():
+                        raise
+                    print(f"[ntc-create-booking] Cloud SQL RPC zlyhalo: {db_exc}, skúšam Supabase RPC fallback...")
+                    if supabase:
+                        rpc_res = supabase.rpc("wallet_create_ntc_booking", rpc_payload).execute()
+                        if not rpc_res.data or len(rpc_res.data) == 0:
+                            raise Exception("Funkcia wallet_create_ntc_booking nevrátila žiadne dáta.")
+                        result_row = rpc_res.data[0]
+                        booking_id = result_row.get("booking_id")
+                        charged_eur = float(result_row.get("charged_eur") or 0.0)
+                        balance_eur = float(result_row.get("balance_eur") or 0.0)
+                    else:
+                        raise
             elif supabase:
                 rpc_res = supabase.rpc("wallet_create_ntc_booking", rpc_payload).execute()
                 if not rpc_res.data or len(rpc_res.data) == 0:
