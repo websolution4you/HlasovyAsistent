@@ -1516,13 +1516,14 @@ async def _get_ntc_busy_courts(start_dt: datetime.datetime, end_dt: datetime.dat
                   FROM public.bookings
                  WHERE tenant_id = $1::uuid
                    AND status <> 'cancelled'
-                   AND start_at < $3
-                   AND end_at > $2;
+                   AND start_at < $3::timestamptz
+                   AND end_at > $2::timestamptz;
             """, NTC_TENANT_ID, start_utc, end_utc)
             busy_courts = set()
             for r in rows:
-                c_id = r.get("court_id")
-                notes = r.get("notes")
+                r_dict = dict(r)
+                c_id = r_dict.get("court_id")
+                notes = r_dict.get("notes")
                 if not c_id and isinstance(notes, str):
                     try:
                         c_id = json.loads(notes).get("courtId")
@@ -1532,11 +1533,9 @@ async def _get_ntc_busy_courts(start_dt: datetime.datetime, end_dt: datetime.dat
                     busy_courts.add(str(c_id).lower().strip())
             return busy_courts
         except Exception as exc:
-            print(f"[busy-courts] Cloud SQL query failed: {exc}")
-            raise HTTPException(
-                status_code=503,
-                detail="Dostupnosť kurtov sa momentálne nedá bezpečne overiť.",
-            ) from exc
+            import traceback
+            traceback.print_exc()
+            print(f"[busy-courts] Cloud SQL query failed: {exc}. Falling back to Supabase...")
 
     # 2. Fallback na Supabase ak je dostupny
     if not supabase:
